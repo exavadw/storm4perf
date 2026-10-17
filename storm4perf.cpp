@@ -449,6 +449,7 @@ static bool install_affinity(bool timer, bool bullet) {
 
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
+#include "storm4perf_support.cpp"
 
 // ================================================================ crash and error logging
 static volatile LONG st_exc;
@@ -602,6 +603,10 @@ static void startup(void) {
         if (ok) g_installed_any = 1;
     }
     install_gpu();
+    if (GetPrivateProfileIntW(L"support", L"enabled", 1, g_ini)) {
+        bool sup = install_support_health();
+        s4log("%s support_health (Revolution-style gauge via native Flash)", sup ? "OK  " : "FAIL");
+    } else s4log("off  support_health ([support] enabled=0)");
     if (GetPrivateProfileIntW(L"gpu", L"options_menu", 1, g_ini)) {
         bool ui = install_ui();
         s4log("%s options menu (Shadow Quality: OFF / VERY LOW / LOW / MEDIUM / HIGH)", ui ? "OK  " : "FAIL");
