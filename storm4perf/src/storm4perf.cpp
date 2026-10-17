@@ -19,7 +19,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.3.1-audiofix"
+#define S4P_VERSION "1.4.0-bugfix"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -467,46 +467,62 @@ static bool install_guardfix(void) {
     if (!write_bytes("guardfix(write)", VA(0x14077E6B6), nops, sizeof nops)) return false;
     if (!write_bytes("guardfix(reset)", VA(0x14077E6E6), nops, sizeof nops)) return false;
     s4log("guardfix: NOPped DAT_141666ebc write at 0x14077E6B6 and reset at 0x14077E6E6 (8B each)");
+
+    // Secondary fix: FUN_1407ebec8 calls FUN_140764210(param_1, ...) where param_1 is the GUARDING player,
+    // not the jutsu user. This overwrites the guarding player's action state (+0x8e4) with the opponent's
+    // jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu recovery animation.
+    // NOP both 5-byte call sites so the mis-targeted cancellation never fires:
+    //   Matched-path call at RVA 0x1407EC26: E8 E5 82 F7 FF (after finding sub-object state 0xe3)
+    //   Fallback call at RVA 0x1407EC49:     E8 C0 82 F7 FF (unconditional path)
+    static const uint8_t call1_e[] = { 0xE8, 0xE5, 0x82, 0xF7, 0xFF };
+    static const uint8_t call2_e[] = { 0xE8, 0xC0, 0x82, 0xF7, 0xFF };
+    if (check_bytes("guardfix(call1)", 0x1407EC26, call1_e, sizeof call1_e)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(call1)", VA(0x1407EC26), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped matched-path FUN_140764210 call at 0x1407EC26");
+    } else {
+        s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EC26)");
+    }
+    if (check_bytes("guardfix(call2)", 0x1407EC49, call2_e, sizeof call2_e)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(call2)", VA(0x1407EC49), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EC49");
+    } else {
+        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EC49)");
+    }
+
     InterlockedIncrement64(&st_guard_nops);
     return true;
 }
 
 // ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
-// ccPlayerPad::PreCtrl() unconditionally clears the command request buffer (memset at this+0x428, size 0xcc)
-// every frame BEFORE input processing. When fast input occurs, the chakra dash/jutsu command (ID 2) is wiped
-// before the player state machine polls IsRequestedCommand(2), causing silent failure despite chakra already
-// being deducted via the ungated UseChakra vtable call at offset 0x5d0.
-// Fix: NOP the two memset calls in PreCtrl that clear the command buffer. The commands will persist one extra
-// frame, which is safe because UpdateSuccessCommand has a 5-frame timeout and IsRequestedCommand checks are
-// idempotent. This gives the state machine time to consume the command before it vanishes.
-// PreCtrl identified by string "ccPlayer.cpp" reference and the memset pattern at known offsets.
+// ccPlayerPad::PreCtrl() unconditionally clears the command request buffer via FUN_1400abd14 (which does
+// memset(param_1, 0, 0xcc)) every frame BEFORE input processing. In NSUNS4 1.09 the compiler emits this
+// as a helper call rather than an inline memset, and the buffer lives at this+0x7c (not 0x428 as on Switch).
+// Two call sites exist: FUN_1400817c0 at VA 0x140081864 and FUN_140081340 at VA 0x1400813e4.
+// Fix: NOP the 5-byte CALL at each site. The lea rcx,[reg+0x7c] argument setup is harmless without the call.
+// Commands will persist one extra frame, safe because UpdateSuccessCommand has a 5-frame timeout.
 static volatile LONG64 st_inputfix_nops;
 static bool install_inputfix(void) {
-    // We search for the PreCtrl memset pattern within ccPlayerPad methods.
-    // The command buffer clear is: lea rcx,[this+0x428]; mov edx,0xcc; xor r8d,r8d; call memset
-    // In NSUNS4 1.09 release, PreCtrl starts near RVA 0x3D4A00 (identified by "ccPlayer.cpp" xref).
-    // We scan for the distinctive sequence: 48 8D 89 28 04 00 00 BA CC 00 00 00 45 33 C0 E8
-    // (lea rcx,[rcx+428h]; mov edx,0xcc; xor r8d,r8d; call ...)
-    static const uint8_t preclear_pat[] = {
-        0x48,0x8D,0x89, 0x28,0x04,0x00,0x00,  // lea rcx,[rcx+0x428]
-        0xBA, 0xCC,0x00,0x00,0x00,             // mov edx, 0xcc
-        0x45,0x33,0xC0                          // xor r8d, r8d
-    };
-    // Search within ccPlayerPad::PreCtrl region (approximate range)
-    uint8_t *base = VA(0x1403D0000);
-    uint8_t *found = NULL;
-    for (int i = 0; i < 0x10000 && !found; i++) {
-        if (memcmp(base + i, preclear_pat, sizeof preclear_pat) == 0) found = base + i;
-    }
-    if (!found) { s4log("SKIP inputfix: cannot find PreCtrl command buffer clear pattern"); return false; }
-    // NOP the lea+mov+xor sequence (14 bytes) AND the following call instruction (5 bytes) = 19 bytes total
-    // Actually safer to just NOP the call itself (the E8 xx xx xx xx after the pattern) so the args stay harmless
-    uint8_t *call_site = found + sizeof preclear_pat; // points to E8 xx xx xx xx
-    if (*call_site != 0xE8) { s4log("SKIP inputfix: expected CALL opcode at %p, found 0x%02X", call_site, *call_site); return false; }
+    // Site 1: FUN_1400817c0 calls FUN_1400abd14 at VA 0x140081864
+    // Bytes: 48 8D 4E 7C E8 AB A4 02 00  (lea rcx,[rsi+0x7c]; call FUN_1400abd14)
+    static const uint8_t site1_pre[] = { 0x48,0x8D,0x4E,0x7C };  // lea rcx,[rsi+0x7c]
+    static const uint8_t site1_call[] = { 0xE8,0xAB,0xA4,0x02,0x00 };
+    // Site 2: FUN_140081340 calls FUN_1400abd14 at VA 0x1400813e4
+    // Bytes: 48 8D 4D 7C E8 2B A9 02 00  (lea rcx,[rbp+0x7c]; call FUN_1400abd14)
+    static const uint8_t site2_pre[] = { 0x48,0x8D,0x4D,0x7C };  // lea rcx,[rbp+0x7c]
+    static const uint8_t site2_call[] = { 0xE8,0x2B,0xA9,0x02,0x00 };
+
+    if (!check_bytes("inputfix(site1_pre)", 0x140081860, site1_pre, sizeof site1_pre)) return false;
+    if (!check_bytes("inputfix(site1_call)", 0x140081864, site1_call, sizeof site1_call)) return false;
+    // Site 2: lea rcx,[rbp+0x7c] is at 0x1400813DC, followed by "mov [rbp+0x44],ax" (66 89 45 44) before the call
+    if (!check_bytes("inputfix(site2_pre)", 0x1400813DC, site2_pre, sizeof site2_pre)) return false;
+    if (!check_bytes("inputfix(site2_call)", 0x1400813E4, site2_call, sizeof site2_call)) return false;
+
     uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("inputfix(precall)", call_site, nops, sizeof nops)) return false;
-    s4log("inputfix: NOPped PreCtrl command buffer clear call at VA %p (RVA 0x%llX)", call_site,
-         (unsigned long long)((uintptr_t)call_site - (uintptr_t)g_exe));
+    if (!write_bytes("inputfix(site1)", VA(0x140081864), nops, sizeof nops)) return false;
+    if (!write_bytes("inputfix(site2)", VA(0x1400813E4), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped FUN_1400abd14 calls at 0x140081864 and 0x1400813E4 (5B each)");
     InterlockedIncrement64(&st_inputfix_nops);
     return true;
 }
@@ -679,6 +695,7 @@ static void startup(void) {
         case 6: ok = install_presentpace(); break;
         case 7: ok = install_guardfix(); break;
         case 8: ok = install_audiocrash(); break;
+        case 9: ok = install_inputfix(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
