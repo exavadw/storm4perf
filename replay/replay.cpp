@@ -13,6 +13,9 @@
 //   character select preloaded, so the battle loads the replay's fighters and stage.
 #include "replay.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <algorithm>
@@ -898,7 +901,7 @@ std::string command(const std::string& args) {
     const std::string name = rest.starts_with("dump ") ? rest.substr(5) : "rngtrace.txt";
     const auto path = g_cfg.root / L"logs" / std::filesystem::path(name);
     std::string out;
-    const size_t n = std::min(g_rng_n.load(), kRngTraceCap);
+    const size_t n = (std::min)(g_rng_n.load(), kRngTraceCap);
     const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     for (size_t i = 0; i < n; ++i) {
       const auto& d = g_rng_trace[i];

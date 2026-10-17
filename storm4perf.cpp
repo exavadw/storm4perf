@@ -10,6 +10,9 @@
 // storm4perf_ui.cpp, section 4c of the doc.
 // Replays ([replay], on by default): save and watch Free Battle VS replays from a native list on the Free Battle menu.
 // The replay code is C++20 and lives in replay/ (storm4perf_replay.cpp boots it); it only hooks game functions.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <intrin.h>
@@ -21,7 +24,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.5.0"
+#define S4P_VERSION "1.6.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -396,33 +399,53 @@ static bool install_presentpace(void) {
     return write_bytes("presentpace", site, b, sizeof b);
 }
 
-// ================================================================ diagnostic 8: inputdelay — log frame-delay buffer value at runtime
+// ================================================================ fix 8: inputdelay — force frame-delay buffer to 30 (0x1e)
 // The frame-delay byte lives at *(uint8_t*)(nuccSys + 0x942). nuccSys is a global pointer at DAT_1416663c8 in 1.09.
-// This hook does NOT patch anything; it samples the value periodically from the background thread and logs it,
-// so we can compare 1.07 vs 1.09 runtime behaviour objectively. Enable with [fixes] inputdelay=1.
-static volatile LONG st_id_samples, st_id_nonzero;
-static uint8_t *g_nuccsys_ptr;  // resolved at startup
-static void sample_input_delay(void) {
-    if (!g_on.inputdelay || !g_nuccsys_ptr) return;
-    uint8_t val = *(volatile uint8_t *)(g_nuccsys_ptr + 0x942);
+// Static analysis shows 1.07 and 1.09 have identical setter code (clamp to 0x3c, default 0x1e), but users report
+// higher perceived input delay in 1.08/1.09. This fix continuously forces the value to 30 every frame from the
+// background thread, overriding any hidden runtime change introduced in 1.08+. Enable with [fixes] inputdelay=1.
+static volatile LONG st_id_samples, st_id_overrides;
+static uint8_t *g_nuccsys_ptr;  // address of the global pointer variable (DAT_1416663c8)
+static volatile LONG st_id_calls;
+static void enforce_input_delay(void) {
+    if (!g_on.inputdelay) return;
+    LONG call_n = InterlockedIncrement(&st_id_calls);
+    // Late-resolve nuccSys: the global pointer is NULL at DllMain time and only set during framework init.
+    if (!g_nuccsys_ptr) {
+        static const uint64_t nuccsys_va = 0x1416663c8;
+        if (!in_exe(nuccsys_va, 8)) { if (call_n <= 3) s4log("inputdelay: call #%ld nuccSys VA outside exe", call_n); return; }
+        g_nuccsys_ptr = VA(nuccsys_va);
+        if (call_n <= 3) s4log("inputdelay: call #%ld set g_nuccsys_ptr=%p", call_n, g_nuccsys_ptr);
+    }
+    uintptr_t base = *(volatile uintptr_t *)g_nuccsys_ptr;
+    if (base < 0x10000 || base > 0x7FFFFFFFFFFFull) {
+        if (call_n <= 5 || call_n % 600 == 0)
+            s4log("inputdelay: call #%ld base=0x%llX invalid (nuccSys not yet init)", call_n, (unsigned long long)base);
+        return;
+    }
+    volatile uint8_t *slot = (volatile uint8_t *)(base + 0x942);
+    uint8_t val = *slot;
     LONG n = InterlockedIncrement(&st_id_samples);
-    if (val != 0) InterlockedIncrement(&st_id_nonzero);
-    if (n <= 20 || n % 300 == 0)
-        s4log("inputdelay: sample #%ld frame_delay=%u (0x%02X)", n, val, val);
+    if (val != 0x1e) {
+        *slot = 0x1e;
+        InterlockedIncrement(&st_id_overrides);
+        if (n <= 20 || n % 300 == 0)
+            s4log("inputdelay: sample #%ld OVERRIDE frame_delay %u -> 30 (base=0x%llX)", n, val, (unsigned long long)base);
+    } else {
+        if (n <= 5 || n % 300 == 0)
+            s4log("inputdelay: sample #%ld frame_delay=%u OK (base=0x%llX)", n, val, (unsigned long long)base);
+    }
 }
 static bool install_inputdelay(void) {
-    // DAT_1416663c8 holds the nuccSys pointer in retail 1.09
     static const uint64_t nuccsys_va = 0x1416663c8;
     if (!in_exe(nuccsys_va, 8)) { s4log("SKIP inputdelay: nuccSys VA outside exe image"); return false; }
     g_nuccsys_ptr = VA(nuccsys_va);
-    // verify the pointer looks valid (non-null, in user space)
     uintptr_t p = *(uintptr_t *)g_nuccsys_ptr;
     if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) {
-        s4log("SKIP inputdelay: nuccSys pointer 0x%llX looks invalid at startup (game may not have initialised yet)", (unsigned long long)p);
-        // still return true: the bg thread will re-check once the game sets it up
+        s4log("inputdelay: nuccSys pointer 0x%llX not yet valid at startup (will retry from bg thread)", (unsigned long long)p);
     } else {
         uint8_t v = *(uint8_t *)(p + 0x942);
-        s4log("inputdelay: nuccSys=0x%llX, initial frame_delay=%u", (unsigned long long)p, v);
+        s4log("inputdelay: nuccSys=0x%llX, initial frame_delay=%u (target=30)", (unsigned long long)p, v);
     }
     return true;
 }
@@ -563,7 +586,29 @@ static BOOL CALLBACK x_load(PINIT_ONCE, PVOID, PVOID *) {
     return TRUE;
 }
 static void x_ensure(void) { InitOnceExecuteOnce(&g_xonce, x_load, NULL, NULL); }
-extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) { x_ensure(); return x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED; }
+// Virtual pad: inject START+A press on pad 0 for the first ~10 seconds after load so headless
+// test instances advance past the title screen and initialise nuccSys. Controlled by
+// [xinput] virtual_pad=1 in storm4perf.ini (read once at startup via g_virtual_pad).
+static volatile LONG g_virtual_pad; // 0 or 1
+static DWORD g_load_tick;           // GetTickCount() when DLL loaded
+static volatile LONG g_getstate_calls; // diagnostic: how many times GetState was called
+extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
+    x_ensure();
+    LONG call_n = InterlockedIncrement(&g_getstate_calls);
+    DWORD r = x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED;
+    if (call_n <= 3 || call_n % 600 == 0)
+        s4log("xinput: GetState call #%ld pad=%u ret=%lu", call_n, i, r);
+    if (g_virtual_pad && i == 0 && s && r == ERROR_SUCCESS) {
+        DWORD elapsed = GetTickCount() - g_load_tick;
+        if (elapsed < 10000) {
+            // XINPUT_GAMEPAD layout: wButtons is the first WORD after dwPacketNumber (DWORD)
+            uint16_t *buttons = (uint16_t *)((uint8_t *)s + 4);
+            *buttons |= 0x0010 | 0x1000; // XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_A
+            if (call_n <= 5) s4log("xinput: virtual_pad injected START+A at %lu ms", elapsed);
+        }
+    }
+    return r;
+}
 extern "C" __declspec(dllexport) DWORD WINAPI XInputSetState(DWORD i, void *v) { x_ensure(); return x_set ? x_set(i, v) : ERROR_DEVICE_NOT_CONNECTED; }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetCapabilities(DWORD i, DWORD f, void *c) { x_ensure(); return x_caps ? x_caps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED; }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetDSoundAudioDeviceGuids(DWORD i, GUID *r, GUID *c) { x_ensure(); return x_guids ? x_guids(i, r, c) : ERROR_DEVICE_NOT_CONNECTED; }
@@ -591,7 +636,7 @@ static DWORD WINAPI bg_thread(void *) {
         if (g_live && GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa) && CompareFileTime(&fa.ftLastWriteTime, &last) != 0) {
             last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
         }
-        sample_input_delay();
+        enforce_input_delay();
         if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
     }
 }
@@ -617,9 +662,12 @@ static void startup(void) {
     AddVectoredExceptionHandler(0, veh);
     g_live = GetPrivateProfileIntW(L"debug", L"live", 0, g_ini);
     GetPrivateProfileStringW(L"xinput", L"forward", L"", g_forward, MAX_PATH, g_ini);
+    g_virtual_pad = GetPrivateProfileIntW(L"xinput", L"virtual_pad", 0, g_ini);
+    g_load_tick = GetTickCount();
 
     s4log("storm4perf %s, exe %ls, image size 0x%zX, PE timestamp 0x%08lX, live=%d", S4P_VERSION, exe, g_exe_size,
          nt->FileHeader.TimeDateStamp, g_live);
+    if (g_virtual_pad) s4log("xinput: virtual_pad=1 (START+A press injected for first 10s on pad 0)");
     wchar_t cfg[MAX_PATH]; swprintf_s(cfg, L"%s\\config.ini", g_dir);
     int fps = GetPrivateProfileIntW(L"screenSetting", L"fps", 30, cfg);
     if (fps != 30) s4log("note: config.ini fps=%d. The game logic is built for 30; 60 has known menu/combat timing bugs.", fps);

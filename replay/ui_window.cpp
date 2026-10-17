@@ -8,6 +8,9 @@
 
 #include <format>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <xinput.h>
 
@@ -96,7 +99,7 @@ void open_now(Request r) {
   if (r.opts.desc_ids.size() == g_ids.size() && !g_ids.empty()) fn<void(__fastcall*)(void*, int)>(kWinShowDesc)(g_win, 0);
   // The cursor setter does not move the selection (StormStory endmenu note); the row is reached with Down presses
   // once the open animation has finished.
-  g_rows_down = std::max(0, r.opts.start_row);
+  g_rows_down = (std::max)(0, r.opts.start_row);
   g_row_wait = 20;
 }
 }  // namespace

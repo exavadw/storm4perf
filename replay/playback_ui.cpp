@@ -13,6 +13,9 @@
 //   HUD: property "scene_battle" → hide 0x1406D9230(scene) / show 0x1406D924C(scene).
 #include "playback_ui.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <xinput.h>
 
@@ -79,7 +82,10 @@ int64_t pause_depth() {
 void push_pause() {
   if (!task_mgr()) return;
   const uint32_t top = fn<uint32_t(__fastcall*)(void*)>(kPauseTop)(task_mgr());
-  fn<void(__fastcall*)(void*, uint32_t)>(kPushPause)(task_mgr(), top | 0x80001);
+  // Use only the logic-pause bit (0x1). The 0x80000 bit freezes the render pipeline and causes a black screen
+  // when frame advance is active; the pause menu's own push uses it because the menu draws over the scene,
+  // but our step-mode pause must keep rendering alive so the frozen frame is visible.
+  fn<void(__fastcall*)(void*, uint32_t)>(kPushPause)(task_mgr(), top | 0x1);
   ++g_our_pauses;
 }
 void pop_pause() {
@@ -98,17 +104,20 @@ void set_hud(bool hidden) {
 // from here — the browser asks).
 enum class SaveState { Hidden, Offer, Saved, Full };
 SaveState g_save = SaveState::Hidden;
+void refresh_labels();  // forward decl: called from save_watched before definition
 void save_watched() {
   const auto file = replay::playing_file();
   if (file.empty() || g_save != SaveState::Offer) return;
   if (replay::count("saved") >= replay::kSavedCap) {
     g_save = SaveState::Full;
+    refresh_labels();
     return;
   }
   std::error_code ec;
   std::filesystem::copy_file(file, replay::folder("saved") / file.filename(), std::filesystem::copy_options::overwrite_existing, ec);
   g_save = ec ? SaveState::Offer : SaveState::Saved;
   log::info("playback: saved {} ({})", file.filename().string(), ec ? ec.message() : "ok");
+  refresh_labels();
 }
 
 void refresh_labels() {
@@ -148,8 +157,8 @@ const Choice kHudChoice{"rpl_hud", "rpl_hud_desc", {"rpl_opt_show", "rpl_opt_hid
                         }};
 const Choice kSaveChoice{"rpl_pause_save", "rpl_pause_save_desc", {"rpl_save_replay", "MSG_Back"}, [] { return 0; },
                          [](int i) {
-                           if (i == 0) save_watched();
-                           refresh_labels();
+                           if (i == 0 && g_save == SaveState::Offer) save_watched();
+                           // After saving (or if already saved/full), do nothing on re-select — the label is the feedback.
                          }};
 std::map<void*, const Choice*> g_items;
 void* g_choice_vtbl[8]{};
@@ -293,6 +302,11 @@ void tick() {
   if (viewing != g_was_viewing) {
     g_was_viewing = viewing;
     if (viewing) {
+      // Reset pause state at the start of every new viewing session. A prior session that ended abnormally
+      // (e.g. Restart Replay while frame advance was active) can leave stale g_our_pauses; popping them here
+      // prevents the task-manager pause stack from accumulating across restarts and crashing the game.
+      while (g_our_pauses > 0) pop_pause();
+      g_step_once = false;
       // A replay watched from the list goes back to the list (the browser reopens on it); Watch Again stays native.
       const auto file = replay::playing_file();
       const bool from_list = !file.empty();
