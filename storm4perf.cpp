@@ -51,13 +51,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix; };
-enum { NFIX = 9 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, audiocrash; };
+enum { NFIX = 10 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "audiocrash" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps; audiocrash: prevent crash on audio device unplug
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -463,6 +463,25 @@ static bool install_anim60fix(void) {
     return write_bytes("anim60fix", VA(0x1403f68d6), nop6, sizeof nop6);
 }
 
+// ================================================================ fix 10: audiocrash — prevent crash on audio device unplug
+// When an audio device is unplugged, XAudio2's OnCriticalError callback (FUN_140026e3c / FUN_140026e60) sets
+// DAT_148a83b28 = 1. The next voice tick in FUN_1400271ac checks that flag and calls vtable+0xb0 on the now-destroyed
+// IXAudio2SourceVoice COM object, causing an access violation. NOP'ing the indirect call at 0x1400271CE prevents the
+// crash; the subsequent GetState call at vtable+0xc8 is safe because XAudio2 returns XAUDIO2_E_DEVICE_INVALIDATED for
+// destroyed voices, and the game's existing error path handles it. Audio does not recover (game has no reinit path),
+// but the game stays alive — matching the behaviour of other titles that lose their audio device mid-session.
+static volatile LONG64 st_audio_nops;
+static bool install_audiocrash(void) {
+    // CALL qword ptr [RAX + 0xb0] at RVA 0x1400271CE inside FUN_1400271ac:
+    //   FF 90 B0 00 00 00
+    static const uint8_t e[] = { 0xFF, 0x90, 0xB0, 0x00, 0x00, 0x00 };
+    if (!check_bytes("audiocrash", 0x1400271CE, e, sizeof e)) return false;
+    static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    if (!write_bytes("audiocrash", VA(0x1400271CE), nop6, sizeof nop6)) return false;
+    InterlockedIncrement64(&st_audio_nops);
+    return true;
+}
+
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
 // timeraffinity: the QPC timer helpers pin the calling thread to CPU 0 around every read and restore it afterwards.
 //   Only those call sites (by return address) on the current-thread pseudo-handle are skipped; QPC itself is unchanged.
@@ -694,6 +713,7 @@ static void startup(void) {
         case 6: ok = install_presentpace(); break;
         case 7: ok = install_inputdelay(); break;
         case 8: ok = install_anim60fix(); break;
+        case 9: ok = install_audiocrash(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
