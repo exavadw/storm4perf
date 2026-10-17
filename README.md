@@ -25,6 +25,7 @@ Uninstall: delete the two files. Steam's "verify files" does not remove them, be
 | `vsyncsleep` | VSync callback thread spins with `Sleep(0)` for 2 ms every 16.7 ms | sleeps toward its deadline |
 | `bulletunpin` (off by default) | pins the 4 physics workers to CPUs 0–3 | leaves them to Windows (no measurable effect, so it stays off) |
 | `presentpace` (off by default) | with in-game vsync on, spins with `Sleep(0)` after every Present until the frame time is up | sleeps on a high-resolution timer, wakes 2 ms early at time-critical priority, then spins the rest. Saves ~0.8 core with vsync on, but cost 1–3 FPS in 3 of 8 runs, all in one 30-minute window while other heavy programs ran |
+| `anim60fix` | Retail 1.09 added a global timer throttle in the character state machine that causes dropped keyframes at 60fps | NOPs the throttle check so animations update every frame as intended |
 
 ## Shadow levels in the Options screen
 
@@ -65,3 +66,49 @@ anywhere in the game, with module and address. Every 5 minutes, and on exit, it 
 
 `build.cmd` (MSVC x64 Build Tools) produces `xinput9_1_0.dll` and its `.pdb`. Set `VCVARS` to your `vcvars64.bat` if the
 Build Tools are not in `C:\BuildTools`.
+
+## Test Instance
+
+- **Location:** `C:\dev\agent-bugfix\game` on henry-desktop
+- **Config:** 960×540 windowed, 30 FPS, vsync off
+- **Patch:** storm4perf v1.3.0 (`xinput9_1_0.dll`)
+- **Assets:** junctions to Steam install (data/dlc)
+
+## Known Bugs Under Investigation
+
+### Bug 1: Guard-hit cancels active jutsu
+
+**Report:** A kunai projectile or item hitting a player's guard can cause other players' running jutsu (e.g. Rasengan) to prematurely end.
+
+**Hypothesis:** The guard-hit handler may be broadcasting a global "interrupt" or "hit confirm" event that doesn't properly scope to the defending player, causing unrelated active jutsu state machines on other players to reset.
+
+**RE targets:**
+- Projectile/guard collision handler
+- Jutsu state machine transition logic
+- Multiplayer event dispatch for hit confirmation
+
+### Bug 2: Fast input drops jutsu / chakra dash
+
+**Report:** Inputting a jutsu or chakra dash too fast can cause the action to not happen even though chakra was consumed.
+
+**Hypothesis:** The input buffer or command recognition window may be too tight, or there's a race between chakra deduction and action commitment where the action gets cancelled but the resource spend isn't refunded. Could also be an animation cancel window issue where a new input overrides a pending action before it fully starts.
+
+**RE targets:**
+- Input buffer / command queue processing
+- Chakra consumption vs action commit ordering
+- Animation state machine transition guards
+- Jutsu activation sequence (charge → commit → execute)
+
+## Approach
+
+1. Reproduce each bug in the test instance
+2. Identify relevant functions via Ghidra (NSUNS4 1.09 release + 1.06 debug)
+3. Patch via storm4perf proxy DLL or standalone patch
+4. Verify fix at 30 FPS
+
+## References
+
+- Storm KB: `storm-kb/memory/storm4-performance-research.md`
+- Storm KB: `storm-kb/memory/storm4-test-instance-setup.md`
+- Ghidra project: Switch Trilogy `main`, NSUNS4 release 1.09 + debug 1.06
+- storm4perf repo: https://github.com/exavadw/storm4perf

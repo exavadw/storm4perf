@@ -1,8 +1,31 @@
-*.dll
-*.pdb
+# Build artifacts
+*.o
 *.obj
-*.exp
+*.dll
+*.exe
+*.pdb
 *.lib
+*.exp
 *.ilk
-build.log
 *.zip
+build.log
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# storm4perf logs
+*.log
+
+# Game assets (never commit)
+data/
+dlc/
+*.cpk
+*.dds
+*.tex

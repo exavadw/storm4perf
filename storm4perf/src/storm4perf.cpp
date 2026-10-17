@@ -1,0 +1,753 @@
+// storm4perf: xinput9_1_0.dll proxy with CPU fixes for Naruto Shippuden: Ultimate Ninja Storm 4 (PC, Steam 1.09,
+// NSUNS4.exe sha256 147e52a3...bc257). Background and measurements: storm4-performance.md, sections 1.5, 3b and 4.
+//
+// Every fix checks the original bytes at each site before it writes anything; a site that differs is skipped and logged.
+// All patches are written once in DllMain, before the game's own code runs. Each hook reads its on/off flag on every
+// call, so with [debug] live=1 the fixes can be switched while the game runs (used for interleaved A/B tests).
+// XInput calls are forwarded to System32\xinput9_1_0.dll, or to the DLL named in [xinput] forward=.
+// Log: storm4perf.log next to the exe (falls back to %TEMP%). Config: storm4perf.ini next to the exe (optional).
+// GPU options ([gpu] shadows=game|potato|off, also in the game's Options > Shadow Quality): storm4perf_gpu.cpp and
+// storm4perf_ui.cpp, section 4c of the doc.
+#include <windows.h>
+#include <d3d11.h>
+#include <intrin.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
+#pragma comment(lib, "synchronization.lib")  // WaitOnAddress / WakeByAddressAll
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
+#endif
+
+#define S4P_VERSION "1.4.0-bugfix"
+
+// ---------------------------------------------------------------- logging
+static HANDLE g_log = INVALID_HANDLE_VALUE;
+static SRWLOCK g_loglock = SRWLOCK_INIT;
+static void s4log(const char *fmt, ...) {
+    if (g_log == INVALID_HANDLE_VALUE) return;
+    char buf[1024]; SYSTEMTIME st; GetLocalTime(&st);
+    int n = _snprintf_s(buf, sizeof buf, _TRUNCATE, "%02u:%02u:%02u.%03u [%5lu] ", st.wHour, st.wMinute, st.wSecond,
+                        st.wMilliseconds, GetCurrentThreadId());
+    if (n < 0) n = 0;
+    va_list ap; va_start(ap, fmt);
+    int m = _vsnprintf_s(buf + n, sizeof buf - n - 2, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    n += m < 0 ? (int)strlen(buf + n) : m;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    AcquireSRWLockExclusive(&g_loglock);
+    DWORD w; WriteFile(g_log, buf, n, &w, NULL);
+    ReleaseSRWLockExclusive(&g_loglock);
+}
+// first 10 occurrences, then every 1000th
+static bool log_limited(volatile LONG *counter) { LONG c = InterlockedIncrement(counter); return c <= 10 || c % 1000 == 0; }
+static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
+    out[0] = 0; for (size_t i = 0; i < n && i * 3 + 3 < cap; i++) sprintf_s(out + i * 3, cap - i * 3, "%02X ", p[i]);
+}
+
+// ---------------------------------------------------------------- config
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, guardfix, audiocrash, inputfix; };
+enum { NFIX = 10 };
+static Flags g_on;                   // what the hooks do right now
+static int g_live, g_installed_any;
+static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "guardfix", "audiocrash", "inputfix" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2
+static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
+
+static volatile LONG g_pace_margin_us, g_pace_boost;
+static void read_fix_flags(LONG out[NFIX]) {
+    g_pace_margin_us = (LONG)GetPrivateProfileIntW(L"fixes", L"presentpace_margin_us", 2000, g_ini);
+    g_pace_boost = (LONG)GetPrivateProfileIntW(L"fixes", L"presentpace_boost", 1, g_ini);
+    for (int i = 0; i < NFIX; i++) {
+        wchar_t key[32]; MultiByteToWideChar(CP_ACP, 0, kFixNames[i], -1, key, 32);
+        out[i] = GetPrivateProfileIntW(L"fixes", key, kFixDefaults[i], g_ini) ? 1 : 0;
+    }
+}
+
+// ---------------------------------------------------------------- exe access and patching
+static uint8_t *g_exe; static size_t g_exe_size; static HMODULE g_self;
+static uint8_t *VA(uint64_t va) { return g_exe + (va - 0x140000000ull); }
+static bool in_exe(uint64_t va, size_t n) { return va >= 0x140000000ull && va - 0x140000000ull + n <= g_exe_size; }
+
+static bool check_bytes(const char *fix, uint64_t va, const uint8_t *expect, size_t n) {
+    if (!in_exe(va, n)) { s4log("SKIP %s: 0x%llX is outside the exe image (not Storm 4 1.09?)", fix, va); return false; }
+    if (memcmp(VA(va), expect, n) == 0) return true;
+    char e[100], f[100]; hex(e, sizeof e, expect, n); hex(f, sizeof f, VA(va), n);
+    s4log("SKIP %s: bytes at 0x%llX differ. expected %s found %s(other exe version, or another mod patched it)", fix, va, e, f);
+    return false;
+}
+static bool write_bytes(const char *fix, uint8_t *p, const void *src, size_t n) {
+    DWORD old;
+    if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) {
+        s4log("ERROR %s: VirtualProtect(%p) failed, error %lu", fix, p, GetLastError()); return false;
+    }
+    memcpy(p, src, n);
+    VirtualProtect(p, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, n);
+    return true;
+}
+static void abs_jmp(uint8_t *b, const void *target, bool call) {  // mov rax, imm64 ; jmp/call rax (12 bytes)
+    b[0] = 0x48; b[1] = 0xB8; memcpy(b + 2, &target, 8); b[10] = 0xFF; b[11] = call ? 0xD0 : 0xE0;
+}
+// one executable page within +-2 GB of the exe, for rel32 call sites
+static uint8_t *g_stub; static size_t g_stub_used;
+static uint8_t *alloc_stub(size_t n) {
+    if (!g_stub) {
+        for (uint64_t a = ((uint64_t)g_exe - 0x10000) & ~0xFFFFull; a > (uint64_t)g_exe - 0x70000000ull; a -= 0x10000)
+            if ((g_stub = (uint8_t *)VirtualAlloc((void *)a, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))) break;
+        if (!g_stub) { s4log("ERROR: no free page within 2 GB of the exe for call stubs"); return NULL; }
+    }
+    if (g_stub_used + n > 0x1000) return NULL;
+    uint8_t *p = g_stub + g_stub_used; g_stub_used = (g_stub_used + n + 15) & ~(size_t)15;
+    return p;
+}
+static bool rel32_to(uint8_t *site, size_t insn_len, const void *target, int32_t *rel) {
+    int64_t d = (int64_t)target - (int64_t)(site + insn_len);
+    if (d < INT32_MIN || d > INT32_MAX) return false;
+    *rel = (int32_t)d; return true;
+}
+// RIP-relative target of `call qword ptr [rip+rel32]` (FF 15) at va, or 0
+static uint8_t *ff15_slot(uint64_t va) {
+    if (!in_exe(va, 6)) return NULL;
+    uint8_t *p = VA(va); if (p[0] != 0xFF || p[1] != 0x15) return NULL;
+    int32_t rel; memcpy(&rel, p + 2, 4); return p + 6 + rel;
+}
+static void **find_iat(const char *dll, const char *fn) {
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_exe; IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_exe + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    for (IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR *)(g_exe + d.VirtualAddress); imp->Name; imp++) {
+        if (_stricmp((char *)(g_exe + imp->Name), dll) != 0) continue;
+        IMAGE_THUNK_DATA64 *nameT = (IMAGE_THUNK_DATA64 *)(g_exe + imp->OriginalFirstThunk);
+        IMAGE_THUNK_DATA64 *addrT = (IMAGE_THUNK_DATA64 *)(g_exe + imp->FirstThunk);
+        for (; nameT->u1.AddressOfData; nameT++, addrT++) {
+            if (IMAGE_SNAP_BY_ORDINAL64(nameT->u1.Ordinal)) continue;
+            if (strcmp(((IMAGE_IMPORT_BY_NAME *)(g_exe + nameT->u1.AddressOfData))->Name, fn) == 0) return (void **)&addrT->u1.Function;
+        }
+    }
+    return NULL;
+}
+
+static LARGE_INTEGER g_qpf;
+static int64_t qpc_us(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000000 / g_qpf.QuadPart; }
+
+// ================================================================ fix 1: GPU frame timer without the blocking readback
+// The render manager (vtable 0x1412F8F60) brackets each frame with two TIMESTAMP queries and a DISJOINT query:
+//   +0x138 FUN_14019C690 begin: Begin(disjoint @+0x180), End(ts0 @+0x188), [+0x198]=1
+//   +0x140 FUN_14019C6E0 end:   End(ts1 @+0x190), End(disjoint), then FUN_14019F400 spins on GetData until all three are
+//                               ready (a full CPU<->GPU sync every frame) and writes the GPU time in us to *out.
+// The value only feeds the load meter (sys+0x464). Replacement: a ring of query sets, read without blocking
+// (D3D11_ASYNC_GETDATA_DONOTFLUSH) one or more frames later; *out keeps the newest finished value.
+typedef void (*GpuBeginFn)(uint8_t *rm);
+typedef void (*GpuEndFn)(uint8_t *rm, uint64_t *out);
+static GpuBeginFn orig_gpu_begin; static GpuEndFn orig_gpu_end;
+enum { QN = 8 };  // the iGPU can run 3-4 frames behind at max frame latency 3; 8 leaves headroom
+struct QSet { ID3D11Query *dj, *t0, *t1; int state; uint32_t frame; };  // state: 0 free, 1 begun, 2 waiting for the GPU
+static QSet g_q[QN]; static int g_qw, g_qr, g_qcur; static ID3D11DeviceContext *g_qctx;
+static bool g_frame_mine, g_qbroken; static uint32_t g_qframe; static uint64_t g_gpu_us;
+static volatile LONG64 st_q_read, st_q_dropped, st_q_disjoint, st_q_lag_sum; static volatile LONG st_q_lag_max, st_q_err;
+
+static void q_release(void) {
+    for (int i = 0; i < QN; i++) {
+        if (g_q[i].dj) g_q[i].dj->Release();
+        if (g_q[i].t0) g_q[i].t0->Release();
+        if (g_q[i].t1) g_q[i].t1->Release();
+        g_q[i] = QSet{};
+    }
+    g_qw = g_qr = 0; g_qctx = NULL;
+}
+static bool q_init(ID3D11DeviceContext *ctx) {
+    q_release();
+    ID3D11Device *dev = NULL; ctx->GetDevice(&dev);
+    if (!dev) { s4log("ERROR gputimer: ID3D11DeviceContext::GetDevice returned NULL"); return false; }
+    D3D11_QUERY_DESC dd = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, td = { D3D11_QUERY_TIMESTAMP, 0 };
+    HRESULT hr = S_OK;
+    for (int i = 0; i < QN && SUCCEEDED(hr); i++) {
+        hr = dev->CreateQuery(&dd, &g_q[i].dj);
+        if (SUCCEEDED(hr)) hr = dev->CreateQuery(&td, &g_q[i].t0);
+        if (SUCCEEDED(hr)) hr = dev->CreateQuery(&td, &g_q[i].t1);
+    }
+    dev->Release();
+    if (FAILED(hr)) { s4log("ERROR gputimer: CreateQuery failed, hr=0x%08lX", (unsigned long)hr); q_release(); return false; }
+    g_qctx = ctx;
+    s4log("gputimer: %d query sets created on context %p", QN, ctx);
+    return true;
+}
+static void q_drain(ID3D11DeviceContext *ctx) {
+    while (g_q[g_qr].state == 2) {
+        QSet &s = g_q[g_qr];
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj; UINT64 a = 0, b = 0;
+        HRESULT hr = ctx->GetData(s.dj, &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_OK) hr = ctx->GetData(s.t0, &a, sizeof a, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_OK) hr = ctx->GetData(s.t1, &b, sizeof b, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE) break;  // not finished yet: try again next frame
+        if (FAILED(hr)) {
+            if (log_limited(&st_q_err)) s4log("ERROR gputimer: GetData failed, hr=0x%08lX (count %ld)", (unsigned long)hr, st_q_err);
+        } else if (dj.Disjoint || !dj.Frequency || b < a) {
+            InterlockedIncrement64(&st_q_disjoint);
+        } else {
+            g_gpu_us = (uint64_t)((double)(b - a) * 1e6 / (double)dj.Frequency);
+            LONG lag = (LONG)(g_qframe - s.frame);
+            InterlockedIncrement64(&st_q_read); InterlockedAdd64(&st_q_lag_sum, lag);
+            if (lag > st_q_lag_max) st_q_lag_max = lag;
+        }
+        s.state = 0; g_qr = (g_qr + 1) % QN;
+    }
+}
+static void hk_gpu_begin(uint8_t *rm) {
+    g_frame_mine = false;
+    if (g_on.gputimer && !g_qbroken) {
+        ID3D11DeviceContext *ctx = *(ID3D11DeviceContext **)(rm + 0x178);
+        if (ctx && ctx != g_qctx && !q_init(ctx)) {
+            g_qbroken = true; s4log("ERROR gputimer: falling back to the game's own (blocking) timer");
+        } else if (ctx) {
+            QSet &s = g_q[g_qw];
+            if (s.state == 2) { s.state = 0; g_qr = (g_qr + 1) % QN; InterlockedIncrement64(&st_q_dropped); }  // GPU is QN frames behind
+            ctx->Begin(s.dj); ctx->End(s.t0);
+            s.state = 1; s.frame = g_qframe; g_qcur = g_qw;
+            *(int *)(rm + 0x198) = 1;
+            g_frame_mine = true;
+            return;
+        }
+    }
+    orig_gpu_begin(rm);
+}
+static void hk_gpu_end(uint8_t *rm, uint64_t *out) {
+    if (!g_frame_mine) { orig_gpu_end(rm, out); return; }  // this frame was begun by the game's code: end it the same way
+    g_frame_mine = false;
+    ID3D11DeviceContext *ctx = g_qctx; QSet &s = g_q[g_qcur];
+    ctx->End(s.t1); ctx->End(s.dj);
+    s.state = 2; g_qw = (g_qcur + 1) % QN; g_qframe++;
+    *(int *)(rm + 0x198) = 0;
+    q_drain(ctx);
+    *out = g_gpu_us;
+    *(int *)(rm + 0x19C) = 0;
+}
+static bool install_gputimer(void) {
+    static const uint8_t begin_e[] = { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9,0x48,0x8B,0x89,0x78,0x01,0x00,0x00,0x48,0x8B,0x01,
+                                       0x48,0x8B,0x93,0x80,0x01,0x00,0x00,0xFF,0x90,0xD8,0x00,0x00,0x00 };
+    static const uint8_t end_e[] = { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x48,0x8D,0xB1,0x70,0x01,
+                                     0x00,0x00,0x48,0x8B,0xFA,0x48,0x8B,0x4E,0x08,0x48,0x8B,0x56,0x20 };
+    static const uint8_t wait_e[] = { 0x40,0x53,0x56,0x57,0x48,0x83,0xEC,0x40,0x83,0x7A,0x1C,0x00 };  // FUN_14019F400
+    if (!check_bytes("gputimer", 0x14019C690, begin_e, sizeof begin_e) || !check_bytes("gputimer", 0x14019C6E0, end_e, sizeof end_e) ||
+        !check_bytes("gputimer", 0x14019F400, wait_e, sizeof wait_e) || !in_exe(0x1412F9098, 16)) return false;
+    void **vt = (void **)VA(0x1412F9098);
+    if (vt[0] != VA(0x14019C690) || vt[1] != VA(0x14019C6E0)) {
+        s4log("SKIP gputimer: render-manager vtable +0x138/+0x140 = %p/%p, expected %p/%p", vt[0], vt[1], VA(0x14019C690), VA(0x14019C6E0));
+        return false;
+    }
+    orig_gpu_begin = (GpuBeginFn)vt[0]; orig_gpu_end = (GpuEndFn)vt[1];
+    void *repl[2] = { (void *)hk_gpu_begin, (void *)hk_gpu_end };
+    return write_bytes("gputimer", (uint8_t *)vt, repl, sizeof repl);
+}
+
+// ================================================================ fix 2: nummSkinningThreadGPU::WaitForEnd (0x1409F45D0)
+// Original: `mov eax,[rcx+68h]; test eax,eax; jz` back to itself, then clears three fields. Same body, backoff wait.
+static void backoff_until_nonzero(volatile int *f) {
+    int64_t t0 = 0;
+    for (unsigned n = 0; *f == 0; n++) {
+        if (n < 64) { _mm_pause(); continue; }
+        if (!t0) t0 = qpc_us();
+        if (qpc_us() - t0 < 1000) { if (!SwitchToThread()) _mm_pause(); }
+        else Sleep(1);
+    }
+}
+static uint64_t skin_wait(uint8_t *o) {
+    volatile int *f = (volatile int *)(o + 0x68);
+    if (g_on.skinwait) backoff_until_nonzero(f);
+    else while (*f == 0) {}
+    *(uint64_t *)(o + 0x10) = *(uint64_t *)(o + 8); *(uint64_t *)(o + 0x18) = 0; *(uint64_t *)(o + 0x30) = 0;
+    return 0;
+}
+static bool install_skinwait(void) {
+    static const uint8_t e[] = { 0x66,0x90,0x8B,0x41,0x68,0x85,0xC0,0x74,0xF9,0x48,0x8B,0x41,0x08,0x48,0x89,0x41,0x10,0x33,0xC0,
+                                 0x48,0x89,0x41,0x18,0x48,0x89,0x41,0x30,0xC3 };
+    if (!check_bytes("skinwait", 0x1409F45D0, e, sizeof e)) return false;
+    uint8_t b[12]; abs_jmp(b, (void *)skin_wait, false);
+    return write_bytes("skinwait", VA(0x1409F45D0), b, sizeof b);
+}
+
+// ================================================================ fix 3: WaitVSync -> Flip wait (loop at 0x1409E1C60)
+// Original: `do {} while (!mmDrawCommandManager::Flip(mgr))`; Flip fails while mgr+0x88 is set, which the draw-command
+// thread clears at 0x14018C8D4 just before LeaveCriticalSection at 0x14018C8E2. That call is redirected to
+// leave_and_wake, so the main thread can sleep in WaitOnAddress on the flag instead of spinning.
+typedef char (*FlipFn)(void *);
+typedef void (WINAPI *LeaveCsFn)(LPCRITICAL_SECTION);
+static FlipFn g_flip; static void **g_flip_mgr; static LeaveCsFn *g_leave_slot; static bool g_wake_ok;
+static volatile LONG64 st_flip_waits;
+static void leave_and_wake(LPCRITICAL_SECTION cs) {
+    (*g_leave_slot)(cs);  // through the exe's IAT slot, so other hooks on it still run
+    void *mgr = *g_flip_mgr;
+    if (mgr) WakeByAddressAll((uint8_t *)mgr + 0x88);
+}
+static void wait_flip(void) {
+    if (!g_on.flipwait) { while (!g_flip(*g_flip_mgr)) {} return; }
+    int64_t t0 = 0;
+    for (unsigned n = 0; !g_flip(*g_flip_mgr); n++) {
+        if (n < 32) { _mm_pause(); continue; }
+        volatile char *flag = (volatile char *)*g_flip_mgr + 0x88; char v = *flag;
+        if (!v) continue;
+        if (g_wake_ok) { WaitOnAddress((void *)flag, &v, 1, 4); continue; }  // 4 ms timeout only as a safety net
+        if (!t0) t0 = qpc_us();
+        if (qpc_us() - t0 < 1000) { if (!SwitchToThread()) _mm_pause(); } else Sleep(1);
+    }
+    InterlockedIncrement64(&st_flip_waits);
+}
+static bool install_flipwait(void) {
+    static const uint8_t e[] = { 0x48,0x8B,0x0D,0x71,0x13,0x35,0x08,0xE8,0x74,0xBB,0x7A,0xFF,0x84,0xC0,0x74,0xF0 };
+    static const uint8_t flip_e[] = { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0xB9,0x88,0x00,0x00,0x00,0x00 };
+    if (!check_bytes("flipwait", 0x1409E1C60, e, sizeof e) || !check_bytes("flipwait", 0x14018D7E0, flip_e, sizeof flip_e)) return false;
+    g_flip = (FlipFn)VA(0x14018D7E0); g_flip_mgr = (void **)VA(0x148D32FD8);
+    // wake-up site (optional: without it the wait falls back to pause/yield/sleep)
+    static const uint8_t w[] = { 0xC6,0x83,0x88,0x00,0x00,0x00,0x00,0x48,0x8B,0x8B,0x90,0x00,0x00,0x00,0xFF,0x15,0xB8,0x08,0xD2,0x00 };
+    if (check_bytes("flipwait(wake)", 0x14018C8D4, w, sizeof w)) {
+        uint8_t *site = VA(0x14018C8E2), *stub = alloc_stub(12); int32_t rel;
+        if (stub && rel32_to(site, 5, stub, &rel)) {
+            g_leave_slot = (LeaveCsFn *)ff15_slot(0x14018C8E2);
+            uint8_t sb[12]; abs_jmp(sb, (void *)leave_and_wake, false); memcpy(stub, sb, sizeof sb);
+            uint8_t b[6] = { 0xE8 }; memcpy(b + 1, &rel, 4); b[5] = 0x90;
+            g_wake_ok = write_bytes("flipwait(wake)", site, b, sizeof b);
+            if (g_wake_ok) s4log("flipwait: render thread wakes the main thread (WaitOnAddress)");
+        } else s4log("SKIP flipwait(wake): no call stub in range; using pause/yield/sleep instead");
+    }
+    uint8_t b[16]; abs_jmp(b, (void *)wait_flip, true); memset(b + 12, 0x90, 4);
+    return write_bytes("flipwait", VA(0x1409E1C60), b, sizeof b);
+}
+
+// ================================================================ fix 5: VSyncCallbackThread sleep (call at 0x1409E0656)
+// Original: Sleep(elapsed_us / 2000) until 16666 us have passed since the start time in RBX, i.e. Sleep(0) spins for the
+// first 2 ms and overshoots by up to ~8 ms later. Replacement sleeps toward the deadline. A stub passes RBX along.
+typedef uint64_t (*TimerUsFn)(void);
+typedef void (*SleepFn)(DWORD);
+static TimerUsFn g_timer_us; static SleepFn g_sleep_thunk;
+static void vsync_sleep(DWORD game_ms, uint64_t start_us) {
+    if (!g_on.vsyncsleep) { g_sleep_thunk(game_ms); return; }
+    int64_t rem = 16666 - (int64_t)(g_timer_us() - start_us);
+    g_sleep_thunk(rem > 2000 ? (DWORD)(rem / 1000 - 1) : 1);
+}
+static bool install_vsyncsleep(void) {
+    static const uint8_t e[] = { 0x48,0xD1,0xE9,0xE8,0xB5,0xC0,0xFF,0xFF,0xE8,0x20,0xDB,0x79,0xFF,0x48,0x8B,0xC8,0x48,0x2B,0xCB,
+                                 0x48,0x81,0xF9,0x1A,0x41,0x00,0x00 };
+    static const uint8_t sleep_e[] = { 0xE9 };  // 0x1409DC710: jmp to the Sleep import thunk
+    if (!check_bytes("vsyncsleep", 0x1409E0653, e, sizeof e) || !check_bytes("vsyncsleep", 0x1409DC710, sleep_e, 1)) return false;
+    g_timer_us = (TimerUsFn)VA(0x14017E180); g_sleep_thunk = (SleepFn)VA(0x1409DC710);
+    uint8_t *site = VA(0x1409E0656), *stub = alloc_stub(15); int32_t rel;
+    if (!stub || !rel32_to(site, 5, stub, &rel)) { s4log("SKIP vsyncsleep: no call stub in range"); return false; }
+    stub[0] = 0x48; stub[1] = 0x89; stub[2] = 0xDA;  // mov rdx, rbx (period start, us)
+    abs_jmp(stub + 3, (void *)vsync_sleep, false);
+    uint8_t b[5] = { 0xE8 }; memcpy(b + 1, &rel, 4);
+    return write_bytes("vsyncsleep", site, b, sizeof b);
+}
+
+// ================================================================ fix 7: vsync-on Present pacing (FUN_14019D900, Sleep(0) at 0x14019DA69)
+// With in-game vsync on, the present function calls Present(1) and then spins with Sleep(0) until (interval+1) * 16666 us
+// have passed since the previous present. At the Sleep(0) call R15 holds that target and RAX the elapsed time, both in us.
+// A stub passes target - elapsed; the hook sleeps on a high-resolution waitable timer to ~0.5 ms before the deadline and
+// spins only the rest, so the present time is not pushed later (an overshoot here would lengthen the frame).
+static volatile LONG64 st_pace_waits, st_pace_sleeps, st_pace_late; static volatile LONG st_pace_late_max_us;
+static void pace_sleep(int64_t remaining_us) {
+    if (!g_on.presentpace) { g_sleep_thunk(0); return; }
+    InterlockedIncrement64(&st_pace_waits);
+    const int64_t margin = g_pace_margin_us;
+    static __declspec(thread) HANDLE timer; static __declspec(thread) bool tried;
+    if (!tried) {
+        tried = true;
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!timer) s4log("presentpace: no high-resolution timer (error %lu); using Sleep(1) steps", GetLastError());
+    }
+    if (remaining_us > margin + 1000) {
+        int64_t t0 = qpc_us(); bool slept = false;
+        if (timer) {
+            LARGE_INTEGER due; due.QuadPart = -(remaining_us - margin) * 10;  // relative, 100 ns units
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+                // time-critical only while asleep: when the timer fires the thread gets a core at once instead of
+                // queueing behind other ready threads (measured late wake-ups of up to 57 ms under load without it)
+                int prio = g_pace_boost ? GetThreadPriority(GetCurrentThread()) : THREAD_PRIORITY_ERROR_RETURN;
+                if (prio != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                WaitForSingleObject(timer, 100);
+                if (prio != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), prio);
+                slept = true;
+            }
+        }
+        if (!slept && remaining_us > margin + 2000) { g_sleep_thunk((DWORD)((remaining_us - margin - 1000) / 1000)); slept = true; }
+        if (slept) {
+            InterlockedIncrement64(&st_pace_sleeps);
+            LONG late = (LONG)(qpc_us() - t0 - remaining_us);  // > 0: woke after the deadline
+            if (late > 0) { InterlockedIncrement64(&st_pace_late); if (late > st_pace_late_max_us) st_pace_late_max_us = late; }
+            return;
+        }
+    }
+    if (!SwitchToThread()) _mm_pause();  // last stretch: the game loop re-checks the time after every call
+}
+static bool install_presentpace(void) {
+    static const uint8_t e[] = { 0x49,0x2B,0x86,0x30,0x01,0x00,0x00,0x49,0x3B,0xC7,0x73,0x0D,0x33,0xC9,0xFF,0x15,0xDF,0xF6,0xD0,0x00,
+                                 0xE9,0xEB,0xFE,0xFF,0xFF };
+    static const uint8_t sleep_e[] = { 0xE9 };
+    if (!check_bytes("presentpace", 0x14019DA5D, e, sizeof e) || !check_bytes("presentpace", 0x1409DC710, sleep_e, 1)) return false;
+    if (ff15_slot(0x14019DA6B) != (uint8_t *)find_iat("KERNEL32.dll", "Sleep")) { s4log("SKIP presentpace: 0x14019DA6B is not a Sleep call"); return false; }
+    g_sleep_thunk = (SleepFn)VA(0x1409DC710);
+    uint8_t *site = VA(0x14019DA69), *stub = alloc_stub(18); int32_t rel;
+    if (!stub || !rel32_to(site, 5, stub, &rel)) { s4log("SKIP presentpace: no call stub in range"); return false; }
+    static const uint8_t pre[] = { 0x4C,0x89,0xF9, 0x48,0x29,0xC1 };  // mov rcx, r15 ; sub rcx, rax  (remaining us)
+    memcpy(stub, pre, sizeof pre); abs_jmp(stub + sizeof pre, (void *)pace_sleep, false);
+    uint8_t b[8] = { 0xE8 }; memcpy(b + 1, &rel, 4); b[5] = b[6] = b[7] = 0x90;  // replaces xor ecx,ecx ; call [Sleep]
+    return write_bytes("presentpace", site, b, sizeof b);
+}
+
+// ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
+// timeraffinity: the QPC timer helpers pin the calling thread to CPU 0 around every read and restore it afterwards.
+//   Only those call sites (by return address) on the current-thread pseudo-handle are skipped; QPC itself is unchanged.
+// bulletunpin: the Bullet worker pool (0x140E0C590) pins its 4 workers to logical CPUs 0-3; the call is skipped.
+typedef DWORD_PTR (WINAPI *SetAffFn)(HANDLE, DWORD_PTR);
+static SetAffFn real_setaff; static uintptr_t g_timer_ret[12]; static int g_ntimer_ret; static uintptr_t g_bullet_ret;
+static DWORD_PTR g_procmask; static volatile LONG64 st_aff_skipped, st_bullet_skipped;
+struct BulletThread { HANDLE h; DWORD_PTR mask; };
+static BulletThread g_bullet[8]; static volatile LONG g_nbullet;
+static DWORD_PTR WINAPI hk_setaff(HANDLE h, DWORD_PTR m) {
+    uintptr_t ra = (uintptr_t)_ReturnAddress();
+    if (g_on.timeraffinity && h == GetCurrentThread())
+        for (int i = 0; i < g_ntimer_ret; i++)
+            if (ra == g_timer_ret[i]) { InterlockedIncrement64(&st_aff_skipped); return g_procmask; }
+    if (ra == g_bullet_ret && g_bullet_ret) {
+        // remember each worker (own handle + the game's mask) so a live toggle can re-pin or unpin it later
+        LONG i = InterlockedIncrement(&g_nbullet) - 1;
+        if (i < 8 && DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &g_bullet[i].h, THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, 0))
+            g_bullet[i].mask = m;
+        s4log("bulletunpin: Bullet worker %lu, game mask 0x%llX, %s", GetThreadId(h), (unsigned long long)m, g_on.bulletunpin ? "left unpinned" : "pinned");
+        if (g_on.bulletunpin) { InterlockedIncrement64(&st_bullet_skipped); return g_procmask; }
+    }
+    return real_setaff(h, m);
+}
+static void bullet_repin(bool unpin) {
+    for (LONG i = 0; i < g_nbullet && i < 8; i++)
+        if (g_bullet[i].h && !real_setaff(g_bullet[i].h, unpin ? g_procmask : g_bullet[i].mask))
+            s4log("ERROR bulletunpin: SetThreadAffinityMask on worker %lu failed, error %lu", GetThreadId(g_bullet[i].h), GetLastError());
+}
+static bool install_affinity(bool timer, bool bullet) {
+    void **slot = find_iat("KERNEL32.dll", "SetThreadAffinityMask");
+    if (!slot) { s4log("SKIP timeraffinity/bulletunpin: SetThreadAffinityMask import not found"); return false; }
+    // pin/restore pairs in mmTimer::GetMilliSecond, GetMicroSecond, the count reset, the timer object ctor, and the present pacing loop
+    static const uint64_t timer_sites[] = { 0x14017E081, 0x14017E0A2, 0x14017E1B1, 0x14017E1D2, 0x14017DFFA, 0x14017E020,
+                                            0x1401B68A8, 0x1401B68C9, 0x14019D981, 0x14019D9A2 };
+    if (timer)
+        for (uint64_t s : timer_sites) {
+            if (ff15_slot(s) == (uint8_t *)slot) g_timer_ret[g_ntimer_ret++] = (uintptr_t)VA(s) + 6;
+            else s4log("SKIP timeraffinity site 0x%llX: not a SetThreadAffinityMask call", s);
+        }
+    if (bullet) {
+        if (ff15_slot(0x140E0C8FB) == (uint8_t *)slot) g_bullet_ret = (uintptr_t)VA(0x140E0C8FB) + 6;
+        else s4log("SKIP bulletunpin: 0x140E0C8FB is not a SetThreadAffinityMask call");
+    }
+    if (!g_ntimer_ret && !g_bullet_ret) return false;
+    DWORD_PTR sm; GetProcessAffinityMask(GetCurrentProcess(), &g_procmask, &sm);
+    real_setaff = (SetAffFn)*slot;
+    void *hk = (void *)hk_setaff;
+    if (!write_bytes("affinity(iat)", (uint8_t *)slot, &hk, sizeof hk)) { real_setaff = NULL; return false; }
+    if (timer) s4log("timeraffinity: %d of %d timer call sites verified", g_ntimer_ret, (int)(sizeof timer_sites / sizeof *timer_sites));
+    return true;
+}
+
+// ================================================================ fix 8: guard-hit global state race (Bug 1)
+// FUN_14077e64c writes the defending player's ID (as float) to global DAT_141666ebc during guard-hit processing,
+// then resets it to 0xff7fffff. Other players' jutsu state machines can read this global in the window between
+// write and reset, causing their active jutsu (e.g. Rasengan) to cancel prematurely.
+// Fix: NOP out both SSE float stores so the transient player ID never reaches the shared variable.
+// The virtual dispatch immediately after still runs correctly (it uses param_1[0x41], not the global).
+static volatile LONG64 st_guard_nops;
+static bool install_guardfix(void) {
+    // WRITE at RVA 0x14077E6B6 (FUN_14077e64c + 0x6A):
+    //   F3 0F 11 05 FE 87 EE 00   movss [rip+0xEE87FE], xmm0  ; store player ID to DAT_141666ebc
+    // RESET at RVA 0x14077E6E6 (FUN_14077e64c + 0x9A):
+    //   F3 0F 11 05 CE 87 EE 00   movss [rip+0xEE87CE], xmm0  ; reset DAT_141666ebc to 0xff7fffff
+    static const uint8_t write_e[] = { 0xF3,0x0F,0x11,0x05, 0xFE,0x87,0xEE,0x00 };
+    static const uint8_t reset_e[] = { 0xF3,0x0F,0x11,0x05, 0xCE,0x87,0xEE,0x00 };
+    if (!check_bytes("guardfix(write)", 0x14077E6B6, write_e, sizeof write_e)) return false;
+    if (!check_bytes("guardfix(reset)", 0x14077E6E6, reset_e, sizeof reset_e)) return false;
+    uint8_t nops[8]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("guardfix(write)", VA(0x14077E6B6), nops, sizeof nops)) return false;
+    if (!write_bytes("guardfix(reset)", VA(0x14077E6E6), nops, sizeof nops)) return false;
+    s4log("guardfix: NOPped DAT_141666ebc write at 0x14077E6B6 and reset at 0x14077E6E6 (8B each)");
+
+    // Secondary fix: multiple guard-hit handlers call FUN_140764210(param_1, ...) where param_1 is the
+    // GUARDING player, not the jutsu user. This overwrites the guarding player's action state (+0x8e4)
+    // with the opponent's jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu
+    // recovery animation. NOP all 5-byte call sites so the mis-targeted cancellation never fires:
+    //   FUN_1407ebec8 matched-path call at RVA 0x1407EBF26: E8 E5 82 F7 FF
+    //   FUN_1407ebec8 fallback call at RVA 0x1407EBF4B:    E8 C0 82 F7 FF
+    //   FUN_1407eb670 guard-hit handler call at RVA 0x1407EB6B7: E8 54 8B F7 FF
+    //   FUN_1407e86e0 projectile-guard handler call at RVA 0x1407E8864: E8 A7 B9 F7 FF
+    struct { const char *tag; uint64_t rva; uint8_t bytes[5]; } calls[] = {
+        { "call1", 0x1407EBF26, { 0xE8, 0xE5, 0x82, 0xF7, 0xFF } },
+        { "call2", 0x1407EBF4B, { 0xE8, 0xC0, 0x82, 0xF7, 0xFF } },
+        { "call3", 0x1407EB6B7, { 0xE8, 0x54, 0x8B, 0xF7, 0xFF } },
+        { "call4", 0x1407E8864, { 0xE8, 0xA7, 0xB9, 0xF7, 0xFF } },
+        // FUN_140787a84 collision handler types 0x12/0x1E (guard-hit): cross-player state sync
+        { "call5", 0x14078854F, { 0xE8, 0xBC, 0xBC, 0xFD, 0xFF } },  // opponent->self
+        { "call6", 0x140788572, { 0xE8, 0x99, 0xBC, 0xFD, 0xFF } },  // self->opponent
+    };
+    for (int i = 0; i < 6; i++) {
+        char label[32]; _snprintf_s(label, sizeof label, _TRUNCATE, "guardfix(%s)", calls[i].tag);
+        if (check_bytes(label, calls[i].rva, calls[i].bytes, 5)) {
+            uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+            if (!write_bytes(label, VA(calls[i].rva), nops5, sizeof nops5)) return false;
+            s4log("guardfix: NOPped FUN_140764210 %s at 0x%llX", calls[i].tag, calls[i].rva);
+        } else {
+            s4log("guardfix: SKIP %s NOP (bytes differ at 0x%llX)", calls[i].tag, calls[i].rva);
+        }
+    }
+
+    // Tertiary fix: the root cause is that FUN_1407aebf8 and FUN_1407af4c4 call FUN_1407ebec8(opponent)
+    // which propagates the opponent's state into the jutsu attacker's +0x8e4 field via FUN_140764210.
+    // NOPping internal FUN_140764210 calls wasn't sufficient because the vtable+0x18 dispatch inside
+    // FUN_1407ebec8 also corrupts state. NOP the entire FUN_1407ebec8 call at both caller sites:
+    //   Site A: FUN_1407aebf8 at VA 0x1407AEFB1: E8 12 CF 03 00 (call FUN_1407ebec8)
+    //   Site B: FUN_1407af4c4 at VA 0x1407AF59D: E8 26 C9 03 00 (call FUN_1407ebec8)
+    static const uint8_t ebec8_a[] = { 0xE8, 0x12, 0xCF, 0x03, 0x00 };
+    static const uint8_t ebec8_b[] = { 0xE8, 0x26, 0xC9, 0x03, 0x00 };
+    if (check_bytes("guardfix(ebec8_a)", 0x1407AEFB1, ebec8_a, sizeof ebec8_a)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(ebec8_a)", VA(0x1407AEFB1), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped FUN_1407ebec8 call in FUN_1407aebf8 at 0x1407AEFB1");
+    } else {
+        s4log("guardfix: SKIP ebec8_a NOP (bytes differ at 0x1407AEFB1)");
+    }
+    if (check_bytes("guardfix(ebec8_b)", 0x1407AF59D, ebec8_b, sizeof ebec8_b)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(ebec8_b)", VA(0x1407AF59D), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped FUN_1407ebec8 call in FUN_1407af4c4 at 0x1407AF59D");
+    } else {
+        s4log("guardfix: SKIP ebec8_b NOP (bytes differ at 0x1407AF59D)");
+    }
+
+    InterlockedIncrement64(&st_guard_nops);
+    return true;
+}
+
+// ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
+// FUN_1407c02dc (ccPlayerPad::PreCtrl / ResetRequestedCommand inlined) calls memset(this+0x428, 0, 0x15c)
+// to clear the command request buffer every frame BEFORE input processing. When fast input occurs, the
+// chakra dash/jutsu command is wiped before the state machine polls IsRequestedCommand, causing silent
+// failure despite chakra already being deducted.
+// Fix: NOP the 5-byte call to memset at RVA 0x1407C035F. The preceding lea/xor/mov setup is harmless
+// without the call. Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame
+// timeout. Note: NSUNS4 release uses size 0x15c (not 0xcc as in Switch Trilogy).
+static volatile LONG64 st_inputfix_nops;
+static bool install_inputfix(void) {
+    // FUN_1407c02dc (ccPlayerPad::PreCtrl / ResetRequestedCommand inlined) at RVA 0x1407C034A:
+    //   48 8D 8B 28 04 00 00   lea rcx,[rbx+0x428]
+    //   33 D2                  xor edx,edx
+    //   41 B8 5C 01 00 00      mov r8d,0x15c
+    //   89 BB 24 04 00 00      mov [rbx+0x424],edi  (interleaved, harmless)
+    //   E8 1A F2 37 00         call memset
+    // NOP just the 5-byte call at RVA 0x1407C035F; the arg setup is harmless without it.
+    // Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame timeout.
+    static const uint8_t expected[] = {
+        0x48,0x8D,0x8B, 0x28,0x04,0x00,0x00, // lea rcx,[rbx+0x428]
+        0x33,0xD2,                            // xor edx,edx
+        0x41,0xB8, 0x5C,0x01,0x00,0x00        // mov r8d,0x15c
+    };
+    if (!check_bytes("inputfix(precall)", 0x1407C034E, expected, sizeof expected)) return false;
+    uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("inputfix(call)", VA(0x1407C0363), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl memset(this+0x428,0,0x15c) call at 0x1407C0363");
+    InterlockedIncrement64(&st_inputfix_nops);
+    return true;
+}
+
+// ================================================================ fix 9: audio device unplug crash
+// When an audio device is unplugged, XAudio2 invokes the IXAudio2EngineCallback::OnCriticalError
+// callback (FUN_140026e3c / FUN_140026e60), which sets DAT_148a83b28 = 1. On the next voice tick
+// (FUN_1400271ac), the code checks this flag and calls vtable+0xb0 on the now-destroyed XAudio2
+// voice COM object, causing an access violation crash.
+// Fix: NOP out the 6-byte indirect call at VA 0x1400271CE (ff 90 b0 00 00 00) so the dead voice
+// is never touched. The subsequent GetState call at vtable+0xc8 (0x1400271DF) is safe because
+// XAudio2 returns XAUDIO2_E_DEVICE_INVALIDATED for destroyed voices rather than crashing.
+static bool install_audiocrash(void) {
+    static const uint8_t expected[] = { 0xFF, 0x90, 0xB0, 0x00, 0x00, 0x00 };
+    if (!check_bytes("audiocrash", 0x1400271CE, expected, sizeof expected)) return false;
+    uint8_t nops[6]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("audiocrash", VA(0x1400271CE), nops, sizeof nops)) return false;
+    s4log("audiocrash: NOPped vtable+0xb0 call at 0x1400271CE (device unplug crash fix)");
+    return true;
+}
+
+#include "storm4perf_gpu.cpp"
+#include "storm4perf_ui.cpp"
+
+// ================================================================ crash and error logging
+static volatile LONG st_exc;
+static bool in_range(uintptr_t a, const void *base, size_t n) { return a >= (uintptr_t)base && a < (uintptr_t)base + n; }
+static size_t g_self_size;
+static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
+    DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c != EXCEPTION_ACCESS_VIOLATION && c != EXCEPTION_ILLEGAL_INSTRUCTION && c != EXCEPTION_PRIV_INSTRUCTION &&
+        c != EXCEPTION_STACK_OVERFLOW && c != EXCEPTION_INT_DIVIDE_BY_ZERO && c != EXCEPTION_IN_PAGE_ERROR && c != 0xC0000374)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t a = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    bool mine = in_range(a, g_self, g_self_size) || (g_stub && in_range(a, g_stub, 0x1000));
+    if (!mine && InterlockedIncrement(&st_exc) > 8) return EXCEPTION_CONTINUE_SEARCH;
+    char where[300] = "?";
+    if (c != EXCEPTION_STACK_OVERFLOW) {
+        HMODULE m = NULL; char name[MAX_PATH];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) &&
+            GetModuleFileNameA(m, name, MAX_PATH)) {
+            const char *b = strrchr(name, '\\'); b = b ? b + 1 : name;
+            if (m == (HMODULE)g_exe) sprintf_s(where, "%s VA 0x%llX", b, (unsigned long long)(a - (uintptr_t)g_exe + 0x140000000ull));
+            else sprintf_s(where, "%s+0x%llX", b, (unsigned long long)(a - (uintptr_t)m));
+        }
+    }
+    ULONG_PTR *info = ep->ExceptionRecord->ExceptionInformation;
+    s4log("%s exception 0x%08lX at %s (%s), access=%llu addr=0x%llX. If the game crashed, send this log.",
+         mine ? "ERROR: storm4perf code raised" : "note: first-chance", c, where, mine ? "inside storm4perf" : "not in storm4perf",
+         (unsigned long long)info[0], (unsigned long long)info[1]);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void log_stats(const char *when) {
+    LONG64 r = st_q_read;
+    s4log("stats (%s): gputimer read=%lld lag_avg=%.2f lag_max=%ld dropped=%lld disjoint=%lld errors=%ld | flip waits=%lld | "
+         "timer pins skipped=%lld | bullet pins skipped=%lld | present pacing calls=%lld sleeps=%lld late=%lld late_max=%ldus", when, r,
+         r ? (double)st_q_lag_sum / r : 0.0, st_q_lag_max, st_q_dropped, st_q_disjoint, st_q_err, st_flip_waits, st_aff_skipped,
+         st_bullet_skipped, st_pace_waits, st_pace_sleeps, st_pace_late, st_pace_late_max_us);
+    s4log("stats (%s): shadow frames forced off=%lld", when, st_shadow_frames_off);
+}
+
+// ---------------------------------------------------------------- XInput forwarding
+typedef DWORD (WINAPI *XGetStateFn)(DWORD, void *);
+typedef DWORD (WINAPI *XSetStateFn)(DWORD, void *);
+typedef DWORD (WINAPI *XGetCapsFn)(DWORD, DWORD, void *);
+typedef DWORD (WINAPI *XGetGuidsFn)(DWORD, GUID *, GUID *);
+static XGetStateFn x_get; static XSetStateFn x_set; static XGetCapsFn x_caps; static XGetGuidsFn x_guids;
+static INIT_ONCE g_xonce = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK x_load(PINIT_ONCE, PVOID, PVOID *) {
+    wchar_t path[MAX_PATH]; HMODULE h = NULL;
+    if (g_forward[0]) {
+        if (wcschr(g_forward, L'\\') || wcschr(g_forward, L'/')) wcscpy_s(path, g_forward);
+        else swprintf_s(path, L"%s\\%s", g_dir, g_forward);
+        h = LoadLibraryW(path);
+        if (!h) s4log("ERROR xinput: cannot load forward=%ls (error %lu); using the system XInput", path, GetLastError());
+        else if (h == g_self) { s4log("ERROR xinput: forward= points at storm4perf itself; using the system XInput"); FreeLibrary(h); h = NULL; }
+    }
+    if (!h) {
+        GetSystemDirectoryW(path, MAX_PATH); wcscat_s(path, L"\\xinput9_1_0.dll");
+        h = LoadLibraryW(path);
+        if (!h) { s4log("ERROR xinput: cannot load %ls (error %lu); controllers will not work", path, GetLastError()); return TRUE; }
+    }
+    x_get = (XGetStateFn)GetProcAddress(h, "XInputGetState"); x_set = (XSetStateFn)GetProcAddress(h, "XInputSetState");
+    x_caps = (XGetCapsFn)GetProcAddress(h, "XInputGetCapabilities");
+    x_guids = (XGetGuidsFn)GetProcAddress(h, "XInputGetDSoundAudioDeviceGuids");
+    s4log("xinput: forwarding to %ls%s", path, x_get && x_set ? "" : " (ERROR: XInputGetState/XInputSetState missing)");
+    return TRUE;
+}
+static void x_ensure(void) { InitOnceExecuteOnce(&g_xonce, x_load, NULL, NULL); }
+extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) { x_ensure(); return x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED; }
+extern "C" __declspec(dllexport) DWORD WINAPI XInputSetState(DWORD i, void *v) { x_ensure(); return x_set ? x_set(i, v) : ERROR_DEVICE_NOT_CONNECTED; }
+extern "C" __declspec(dllexport) DWORD WINAPI XInputGetCapabilities(DWORD i, DWORD f, void *c) { x_ensure(); return x_caps ? x_caps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED; }
+extern "C" __declspec(dllexport) DWORD WINAPI XInputGetDSoundAudioDeviceGuids(DWORD i, GUID *r, GUID *c) { x_ensure(); return x_guids ? x_guids(i, r, c) : ERROR_DEVICE_NOT_CONNECTED; }
+
+// ---------------------------------------------------------------- start-up and the background thread
+static bool g_hooked[NFIX];
+static void apply_flags(const LONG want[NFIX], bool initial) {
+    char msg[240] = ""; size_t k = 0;
+    for (int i = 0; i < NFIX; i++) {
+        LONG v = g_hooked[i] ? want[i] : 0;
+        if (!initial && *flag_ptr(i) == v) continue;
+        InterlockedExchange(flag_ptr(i), v);
+        if (i == 5 && !initial) bullet_repin(v != 0);
+        k += sprintf_s(msg + k, sizeof msg - k, " %s=%ld", kFixNames[i], v);
+    }
+    if (k) s4log("%s:%s", initial ? "active" : "live change", msg);
+}
+static DWORD WINAPI bg_thread(void *) {
+    x_ensure();
+    FILETIME last = {}; WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa)) last = fa.ftLastWriteTime;
+    DWORD last_stats = GetTickCount();
+    for (;;) {
+        Sleep(g_live ? 250 : 5000);
+        if (g_live && GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa) && CompareFileTime(&fa.ftLastWriteTime, &last) != 0) {
+            last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
+        }
+        if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
+    }
+}
+static void open_log(void) {
+    wchar_t p[MAX_PATH]; swprintf_s(p, L"%s\\storm4perf.log", g_dir);
+    g_log = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_log == INVALID_HANDLE_VALUE) {
+        wchar_t t[MAX_PATH]; GetTempPathW(MAX_PATH, t); swprintf_s(p, L"%sstorm4perf.log", t);
+        g_log = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+}
+static void startup(void) {
+    g_exe = (uint8_t *)GetModuleHandleW(NULL);
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_exe + ((IMAGE_DOS_HEADER *)g_exe)->e_lfanew);
+    g_exe_size = nt->OptionalHeader.SizeOfImage;
+    { IMAGE_NT_HEADERS64 *sn = (IMAGE_NT_HEADERS64 *)((uint8_t *)g_self + ((IMAGE_DOS_HEADER *)g_self)->e_lfanew); g_self_size = sn->OptionalHeader.SizeOfImage; }
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH);
+    wcscpy_s(g_dir, exe); wchar_t *sl = wcsrchr(g_dir, L'\\'); if (sl) *sl = 0;
+    swprintf_s(g_ini, L"%s\\storm4perf.ini", g_dir);
+    int log_on = GetPrivateProfileIntW(L"debug", L"log", 1, g_ini);
+    if (log_on) open_log();
+    QueryPerformanceFrequency(&g_qpf);
+    AddVectoredExceptionHandler(0, veh);
+    g_live = GetPrivateProfileIntW(L"debug", L"live", 0, g_ini);
+    GetPrivateProfileStringW(L"xinput", L"forward", L"", g_forward, MAX_PATH, g_ini);
+
+    s4log("storm4perf %s, exe %ls, image size 0x%zX, PE timestamp 0x%08lX, live=%d", S4P_VERSION, exe, g_exe_size,
+         nt->FileHeader.TimeDateStamp, g_live);
+    wchar_t cfg[MAX_PATH]; swprintf_s(cfg, L"%s\\config.ini", g_dir);
+    int fps = GetPrivateProfileIntW(L"screenSetting", L"fps", 30, cfg);
+    if (fps != 30) s4log("note: config.ini fps=%d. The game logic is built for 30; 60 has known menu/combat timing bugs.", fps);
+
+    LONG want[NFIX]; read_fix_flags(want);
+    bool any_aff = false;
+    for (int i = 0; i < NFIX; i++) {
+        if (!want[i] && !g_live) { s4log("off  %s (off in storm4perf.ini, or off by default)", kFixNames[i]); continue; }
+        bool ok = false;
+        switch (i) {
+        case 0: ok = install_gputimer(); break;
+        case 1: ok = install_skinwait(); break;
+        case 2: ok = install_flipwait(); break;
+        case 3: case 5:
+            if (!any_aff) {
+                any_aff = true;
+                bool t = want[3] || g_live, b = want[5] || g_live;
+                ok = install_affinity(t, b);
+                g_hooked[3] = ok && g_ntimer_ret > 0; g_hooked[5] = ok && g_bullet_ret != 0;
+            }
+            ok = g_hooked[i];
+            break;
+        case 4: ok = install_vsyncsleep(); break;
+        case 6: ok = install_presentpace(); break;
+        case 7: ok = install_guardfix(); break;
+        case 8: ok = install_audiocrash(); break;
+        case 9: ok = install_inputfix(); break;
+        }
+        g_hooked[i] = ok;
+        s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
+        if (ok) g_installed_any = 1;
+    }
+    install_gpu();
+    if (GetPrivateProfileIntW(L"gpu", L"options_menu", 1, g_ini)) {
+        bool ui = install_ui();
+        s4log("%s options menu (Shadow Quality: OFF / VERY LOW / LOW / MEDIUM / HIGH)", ui ? "OK  " : "FAIL");
+    } else s4log("off  options menu ([gpu] options_menu=0)");
+    if (g_stub) { DWORD old; VirtualProtect(g_stub, 0x1000, PAGE_EXECUTE_READ, &old); }
+    apply_flags(want, true);
+    if (!g_installed_any) s4log("no fix was applied: this does not look like Storm 4 1.09 (XInput still works)");
+}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        g_self = h;
+        startup();
+        HANDLE t = CreateThread(NULL, 0, bg_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t); else s4log("ERROR: CreateThread failed, error %lu", GetLastError());
+    } else if (reason == DLL_PROCESS_DETACH) {
+        log_stats(reserved ? "process exit" : "unload");
+        if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
+    }
+    return TRUE;
+}
