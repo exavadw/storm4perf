@@ -74,6 +74,16 @@ Build Tools are not in `C:\BuildTools`.
 - **Patch:** storm4perf v1.3.0 (`xinput9_1_0.dll`)
 - **Assets:** junctions to Steam install (data/dlc)
 
+## Bug Fix History
+
+### anim60fix — Dropped keyframes at 60fps (v1.3.0)
+
+**Bug:** Retail 1.09 drops animation keyframes when running at 60fps; Debug 1.06 plays them correctly. Effects and character animations appear choppy or skip poses.
+
+**Attempt 1 (incorrect, reverted):** NOP'd `call FUN_140a09830` at VA `0x140a0ad14`, hypothesizing that an extra animation update pass in Retail caused double-advancement of the frame-skip counter. Testing showed this did not fix the issue — the dropped keyframes persisted. The extra pass was a red herring; it only fires under specific conditions unrelated to the core timing bug.
+
+**Attempt 2 (correct, shipped as v1.3.0):** Binary comparison of `FUN_1403f6820` (Retail) vs `FUN_14044c8c0` (Debug) revealed that Retail added a global static timer throttle (`DAT_1415da7d0`) in the character state machine. This shared counter gates ALL characters' animation updates through a single cadence, causing dropped keyframes when multiple objects compete for update slots. The fix NOPs the `JL` conditional at VA `0x1403f68d6` (6 bytes → `0x90 × 6`), removing the throttle so each character's animation updates independently every frame, matching Debug 1.06 behavior. Verified working on henry-desktop test instance at 60fps.
+
 ## Known Bugs Under Investigation
 
 ### Bug 1: Guard-hit cancels active jutsu
