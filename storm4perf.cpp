@@ -19,7 +19,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.2.0"
+#define S4P_VERSION "1.3.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -46,13 +46,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace; };
-enum { NFIX = 7 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix; };
+enum { NFIX = 9 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -394,6 +394,50 @@ static bool install_presentpace(void) {
     return write_bytes("presentpace", site, b, sizeof b);
 }
 
+// ================================================================ diagnostic 8: inputdelay — log frame-delay buffer value at runtime
+// The frame-delay byte lives at *(uint8_t*)(nuccSys + 0x942). nuccSys is a global pointer at DAT_1416663c8 in 1.09.
+// This hook does NOT patch anything; it samples the value periodically from the background thread and logs it,
+// so we can compare 1.07 vs 1.09 runtime behaviour objectively. Enable with [fixes] inputdelay=1.
+static volatile LONG st_id_samples, st_id_nonzero;
+static uint8_t *g_nuccsys_ptr;  // resolved at startup
+static void sample_input_delay(void) {
+    if (!g_on.inputdelay || !g_nuccsys_ptr) return;
+    uint8_t val = *(volatile uint8_t *)(g_nuccsys_ptr + 0x942);
+    LONG n = InterlockedIncrement(&st_id_samples);
+    if (val != 0) InterlockedIncrement(&st_id_nonzero);
+    if (n <= 20 || n % 300 == 0)
+        s4log("inputdelay: sample #%ld frame_delay=%u (0x%02X)", n, val, val);
+}
+static bool install_inputdelay(void) {
+    // DAT_1416663c8 holds the nuccSys pointer in retail 1.09
+    static const uint64_t nuccsys_va = 0x1416663c8;
+    if (!in_exe(nuccsys_va, 8)) { s4log("SKIP inputdelay: nuccSys VA outside exe image"); return false; }
+    g_nuccsys_ptr = VA(nuccsys_va);
+    // verify the pointer looks valid (non-null, in user space)
+    uintptr_t p = *(uintptr_t *)g_nuccsys_ptr;
+    if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) {
+        s4log("SKIP inputdelay: nuccSys pointer 0x%llX looks invalid at startup (game may not have initialised yet)", (unsigned long long)p);
+        // still return true: the bg thread will re-check once the game sets it up
+    } else {
+        uint8_t v = *(uint8_t *)(p + 0x942);
+        s4log("inputdelay: nuccSys=0x%llX, initial frame_delay=%u", (unsigned long long)p, v);
+    }
+    return true;
+}
+
+// ================================================================ fix 9: anim60fix — remove global timer throttle in Retail character state machine
+// Retail 1.09 FUN_1403f6820 (param_2==7 case) uses a global static timer (DAT_1415da7d0) to throttle animation
+// updates across ALL characters, causing dropped keyframes at 60fps when multiple objects compete for the same
+// update slot. Debug 1.06 FUN_14044c8c0 has no such global throttle and uses per-object frame-skip counters instead.
+// Fix: NOP the JL at 0x1403f68d6 (0F 8C A7 04 00 00) that skips the update when the shared counter hasn't
+// reached the threshold, so every object gets its update every frame as intended.
+static bool install_anim60fix(void) {
+    static const uint8_t e[] = { 0x0F, 0x8C, 0xA7, 0x04, 0x00, 0x00 }; // JL 0x1403f6d83 at 0x1403f68d6
+    if (!check_bytes("anim60fix", 0x1403f68d6, e, sizeof e)) return false;
+    static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    return write_bytes("anim60fix", VA(0x1403f68d6), nop6, sizeof nop6);
+}
+
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
 // timeraffinity: the QPC timer helpers pin the calling thread to CPU 0 around every read and restore it afterwards.
 //   Only those call sites (by return address) on the current-thread pseudo-handle are skipped; QPC itself is unchanged.
@@ -544,6 +588,7 @@ static DWORD WINAPI bg_thread(void *) {
         if (g_live && GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa) && CompareFileTime(&fa.ftLastWriteTime, &last) != 0) {
             last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
         }
+        sample_input_delay();
         if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
     }
 }
@@ -596,6 +641,8 @@ static void startup(void) {
             break;
         case 4: ok = install_vsyncsleep(); break;
         case 6: ok = install_presentpace(); break;
+        case 7: ok = install_inputdelay(); break;
+        case 8: ok = install_anim60fix(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
