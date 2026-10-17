@@ -450,17 +450,29 @@ static bool install_inputdelay(void) {
     return true;
 }
 
-// ================================================================ fix 9: anim60fix — remove global timer throttle in Retail character state machine
-// Retail 1.09 FUN_1403f6820 (param_2==7 case) uses a global static timer (DAT_1415da7d0) to throttle animation
-// updates across ALL characters, causing dropped keyframes at 60fps when multiple objects compete for the same
-// update slot. Debug 1.06 FUN_14044c8c0 has no such global throttle and uses per-object frame-skip counters instead.
-// Fix: NOP the JL at 0x1403f68d6 (0F 8C A7 04 00 00) that skips the update when the shared counter hasn't
-// reached the threshold, so every object gets its update every frame as intended.
+// ================================================================ fix 9: anim60fix — remove two 60fps animation bugs in Retail 1.09
+// Bug A: FUN_1403f6820 (param_2==7) uses a global static timer (DAT_1415da7d0) to throttle character
+//   state machine updates. At 60fps the threshold doubles but the accumulator races ahead, causing
+//   uneven update cadence and dropped keyframes. Debug 1.06 FUN_14044c8c0 has no such throttle.
+//   Fix: NOP the JL at 0x1403f68d6 (0F 8C A7 04 00 00) so the update always fires.
+// Bug B: FUN_140a0aa00 (nuccSys inner update) calls FUN_140a09830 — an extra animation time advance
+//   pass gated on DAT_1416663c8+0x590. This pass runs outside the normal frame-skip cadence and
+//   advances animation time a third time per frame at 60fps, skipping keyframes. Debug 1.06 has
+//   no equivalent function or call site. Original fix attempt (commit dc374c5) was reverted without
+//   explanation; combining with Bug A fix here under the same flag.
+//   Fix: NOP the CALL at 0x140a0ad14 (E8 17 EB FF FF). Safe at 30fps (flag doesn't trigger there).
+// Both patches are deterministic (no wall-clock or thread-timing dependence), safe for replays.
 static bool install_anim60fix(void) {
-    static const uint8_t e[] = { 0x0F, 0x8C, 0xA7, 0x04, 0x00, 0x00 }; // JL 0x1403f6d83 at 0x1403f68d6
-    if (!check_bytes("anim60fix", 0x1403f68d6, e, sizeof e)) return false;
+    // Bug A: NOP the JL throttle in character state machine
+    static const uint8_t ea[] = { 0x0F, 0x8C, 0xA7, 0x04, 0x00, 0x00 }; // JL 0x1403f6d83
+    if (!check_bytes("anim60fix:A", 0x1403f68d6, ea, sizeof ea)) return false;
     static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-    return write_bytes("anim60fix", VA(0x1403f68d6), nop6, sizeof nop6);
+    if (!write_bytes("anim60fix:A", VA(0x1403f68d6), nop6, sizeof nop6)) return false;
+    // Bug B: NOP the extra animation pass call in nuccSys inner update
+    static const uint8_t eb[] = { 0xE8, 0x17, 0xEB, 0xFF, 0xFF }; // CALL FUN_140a09830
+    if (!check_bytes("anim60fix:B", 0x140a0ad14, eb, sizeof eb)) return false;
+    static const uint8_t nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
+    return write_bytes("anim60fix:B", VA(0x140a0ad14), nop5, sizeof nop5);
 }
 
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
