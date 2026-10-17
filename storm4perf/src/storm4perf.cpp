@@ -46,13 +46,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, guardfix, audiocrash; };
-enum { NFIX = 9 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, guardfix, audiocrash, inputfix; };
+enum { NFIX = 10 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "guardfix", "audiocrash" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "guardfix", "audiocrash", "inputfix" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -448,32 +448,66 @@ static bool install_affinity(bool timer, bool bullet) {
 }
 
 // ================================================================ fix 8: guard-hit global state race (Bug 1)
-// FUN_14077e64c writes the defending player's ID to global DAT_141666ebc during guard-hit processing, then resets it
-// to 0xff7fffff. Other players' jutsu state machines can read this global in the window between write and reset,
-// causing their active jutsu (e.g. Rasengan) to cancel prematurely via FUN_1407ebec8 -> FUN_140764210.
-// Fix: NOP out the global write and reset at RVA 0x77E64C+0x3A..0x77E64C+0x4F so the transient player ID never
-// reaches the shared variable. The virtual dispatch immediately after still runs correctly (it uses param_1[0x41],
-// not the global). Secondary validation at FUN_1407ebec8 is left for future work if needed.
+// FUN_14077e64c writes the defending player's ID (as float) to global DAT_141666ebc during guard-hit processing,
+// then resets it to 0xff7fffff. Other players' jutsu state machines can read this global in the window between
+// write and reset, causing their active jutsu (e.g. Rasengan) to cancel prematurely.
+// Fix: NOP out both SSE float stores so the transient player ID never reaches the shared variable.
+// The virtual dispatch immediately after still runs correctly (it uses param_1[0x41], not the global).
 static volatile LONG64 st_guard_nops;
 static bool install_guardfix(void) {
-    // At RVA 0x14077E686 (FUN_14077e64c + 0x3A):
-    //   8B 87 4C 00 00 00       mov eax, [rdi+4Ch]     ; load player ID from param_1[0x13]*4
-    //   89 05 30 88 EE 00       mov [rip+0xEE8830], eax ; store to DAT_141666ebc (global)
-    // At RVA 0x14077E69C (FUN_14077e64c + 0x50):
-    //   C7 05 1A 88 EE 00 FF FF 7F FF  mov dword [rip+0xEE881A], 0xff7fffff ; reset global
-    // We NOP both sequences (6 bytes each = 12 bytes total) so the global is never touched.
-    static const uint8_t write_e[] = { 0x8B,0x87,0x4C,0x00,0x00,0x00, 0x89,0x05,0x30,0x88,0xEE,0x00 };
-    static const uint8_t reset_e[] = { 0xC7,0x05,0x1A,0x88,0xEE,0x00,0xFF,0xFF,0x7F,0xFF };
-    // Verify both sites
-    if (!check_bytes("guardfix(write)", 0x14077E686, write_e, sizeof write_e)) return false;
-    if (!check_bytes("guardfix(reset)", 0x14077E69C, reset_e, sizeof reset_e)) return false;
-    // NOP the write site (12 bytes)
-    uint8_t nops[12]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("guardfix(write)", VA(0x14077E686), nops, sizeof nops)) return false;
-    // NOP the reset site (10 bytes)
-    uint8_t nops2[10]; memset(nops2, 0x90, sizeof nops2);
-    if (!write_bytes("guardfix(reset)", VA(0x14077E69C), nops2, sizeof nops2)) return false;
-    s4log("guardfix: NOPped global write at 0x14077E686 (12B) and reset at 0x14077E69C (10B)");
+    // WRITE at RVA 0x14077E6B6 (FUN_14077e64c + 0x6A):
+    //   F3 0F 11 05 FE 87 EE 00   movss [rip+0xEE87FE], xmm0  ; store player ID to DAT_141666ebc
+    // RESET at RVA 0x14077E6E6 (FUN_14077e64c + 0x9A):
+    //   F3 0F 11 05 CE 87 EE 00   movss [rip+0xEE87CE], xmm0  ; reset DAT_141666ebc to 0xff7fffff
+    static const uint8_t write_e[] = { 0xF3,0x0F,0x11,0x05, 0xFE,0x87,0xEE,0x00 };
+    static const uint8_t reset_e[] = { 0xF3,0x0F,0x11,0x05, 0xCE,0x87,0xEE,0x00 };
+    if (!check_bytes("guardfix(write)", 0x14077E6B6, write_e, sizeof write_e)) return false;
+    if (!check_bytes("guardfix(reset)", 0x14077E6E6, reset_e, sizeof reset_e)) return false;
+    uint8_t nops[8]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("guardfix(write)", VA(0x14077E6B6), nops, sizeof nops)) return false;
+    if (!write_bytes("guardfix(reset)", VA(0x14077E6E6), nops, sizeof nops)) return false;
+    s4log("guardfix: NOPped DAT_141666ebc write at 0x14077E6B6 and reset at 0x14077E6E6 (8B each)");
+    InterlockedIncrement64(&st_guard_nops);
+    return true;
+}
+
+// ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
+// ccPlayerPad::PreCtrl() unconditionally clears the command request buffer (memset at this+0x428, size 0xcc)
+// every frame BEFORE input processing. When fast input occurs, the chakra dash/jutsu command (ID 2) is wiped
+// before the player state machine polls IsRequestedCommand(2), causing silent failure despite chakra already
+// being deducted via the ungated UseChakra vtable call at offset 0x5d0.
+// Fix: NOP the two memset calls in PreCtrl that clear the command buffer. The commands will persist one extra
+// frame, which is safe because UpdateSuccessCommand has a 5-frame timeout and IsRequestedCommand checks are
+// idempotent. This gives the state machine time to consume the command before it vanishes.
+// PreCtrl identified by string "ccPlayer.cpp" reference and the memset pattern at known offsets.
+static volatile LONG64 st_inputfix_nops;
+static bool install_inputfix(void) {
+    // We search for the PreCtrl memset pattern within ccPlayerPad methods.
+    // The command buffer clear is: lea rcx,[this+0x428]; mov edx,0xcc; xor r8d,r8d; call memset
+    // In NSUNS4 1.09 release, PreCtrl starts near RVA 0x3D4A00 (identified by "ccPlayer.cpp" xref).
+    // We scan for the distinctive sequence: 48 8D 89 28 04 00 00 BA CC 00 00 00 45 33 C0 E8
+    // (lea rcx,[rcx+428h]; mov edx,0xcc; xor r8d,r8d; call ...)
+    static const uint8_t preclear_pat[] = {
+        0x48,0x8D,0x89, 0x28,0x04,0x00,0x00,  // lea rcx,[rcx+0x428]
+        0xBA, 0xCC,0x00,0x00,0x00,             // mov edx, 0xcc
+        0x45,0x33,0xC0                          // xor r8d, r8d
+    };
+    // Search within ccPlayerPad::PreCtrl region (approximate range)
+    uint8_t *base = VA(0x1403D0000);
+    uint8_t *found = NULL;
+    for (int i = 0; i < 0x10000 && !found; i++) {
+        if (memcmp(base + i, preclear_pat, sizeof preclear_pat) == 0) found = base + i;
+    }
+    if (!found) { s4log("SKIP inputfix: cannot find PreCtrl command buffer clear pattern"); return false; }
+    // NOP the lea+mov+xor sequence (14 bytes) AND the following call instruction (5 bytes) = 19 bytes total
+    // Actually safer to just NOP the call itself (the E8 xx xx xx xx after the pattern) so the args stay harmless
+    uint8_t *call_site = found + sizeof preclear_pat; // points to E8 xx xx xx xx
+    if (*call_site != 0xE8) { s4log("SKIP inputfix: expected CALL opcode at %p, found 0x%02X", call_site, *call_site); return false; }
+    uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("inputfix(precall)", call_site, nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl command buffer clear call at VA %p (RVA 0x%llX)", call_site,
+         (unsigned long long)((uintptr_t)call_site - (uintptr_t)g_exe));
+    InterlockedIncrement64(&st_inputfix_nops);
     return true;
 }
 
