@@ -29,3 +29,4 @@ dlc/
 *.cpk
 *.dds
 *.tex
+obj/

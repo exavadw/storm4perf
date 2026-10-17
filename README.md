@@ -1,18 +1,57 @@
 # storm4perf
 
 A drop-in `xinput9_1_0.dll` for **Naruto Shippuden: Ultimate Ninja Storm 4** on PC (Steam 1.09,
-`NSUNS4.exe` SHA-256 `147e52a3…bc257`). It removes busy-waits from the engine and leaves gameplay unchanged, and it adds
-two cheaper shadow levels to the game's own Options screen.
+`NSUNS4.exe` SHA-256 `147e52a3…bc257`). It removes busy-waits from the engine and leaves gameplay unchanged, adds
+two cheaper shadow levels to the game's own Options screen, and adds **replays**: every Free Battle VS battle is recorded,
+and you can watch, save and delete replays from a list on the Free Battle menu, all in the game's own menus.
 Measured at 30 FPS on an Intel UHD 770: the game uses a quarter to a third of the CPU it used before, and on a
 2-thread CPU it runs at full speed instead of in slow motion. Details and numbers: [`docs/storm4-performance.md`](docs/storm4-performance.md), sections 3b and 4.
 
 ## Install
 
-1. Download `storm4perf-<version>.zip` from Releases and copy `xinput9_1_0.dll` (and optionally `storm4perf.ini`) next to
-   `NSUNS4.exe` (Steam: right-click the game > Manage > Browse local files).
-2. Start the game. `storm4perf.log` appears next to the exe and lists every fix as `OK`, `SKIP` or `FAIL`.
+1. Download `storm4perf-<version>.zip` from [Releases](https://github.com/exavadw/storm4perf/releases).
+2. Open the game folder: in Steam, right-click **NARUTO SHIPPUDEN: Ultimate Ninja STORM 4** > **Manage** >
+   **Browse local files**. It is the folder with `NSUNS4.exe`.
+3. Copy `xinput9_1_0.dll` and `storm4perf.ini` from the zip into that folder. If the folder already has an
+   `xinput9_1_0.dll` from another mod, see [Compatibility](#compatibility) first.
+4. Start the game. `storm4perf.log` appears next to the exe and lists every fix as `OK`, `SKIP` or `FAIL`, and
+   `OK replays` when replays are on.
 
-Uninstall: delete the two files. Steam's "verify files" does not remove them, because they are not game files.
+Settings live in `storm4perf.ini` (optional; missing keys use the defaults shown in it).
+
+Uninstall: delete `xinput9_1_0.dll` and `storm4perf.ini`. Steam's "verify files" does not remove them, because they are
+not game files. Your replays stay in the `StormReplay` folder until you delete it.
+
+## Replays
+
+Every **VS Battle** in **Free Battle** (against the CPU or local 2P) is recorded automatically. Nothing to set up.
+
+- **Open the list:** on the Free Battle menu, press **Y** (the button guide shows *Replays*).
+- **Tabs:** **LB / RB** switch between **Saved** and **Recent**. Recent keeps the last 20 battles (oldest removed first);
+  Saved keeps up to 150 until you delete them. The highlighted replay's stage, rounds, winner, length and date show in
+  the help bar at the bottom; ★ marks the winner.
+- **Actions:** **A** on a replay: **Watch**, **Save** (Recent only; moves it to Saved), **Delete**, **Back**.
+- **While watching:** **Start** opens the pause menu with **Restart Replay**, **Playback Speed** (1/4x, 1/2x, 1x, 2x, 4x),
+  **Frame Advance**, **HUD Display**, **Save Replay** (for Recent replays), the command and combo lists, and
+  **Return to Replays**. With frame advance on, **RB** steps one frame. Your controller does not affect the replay.
+- **After a replay:** **Watch Again** or **Return to Replays**.
+- **After a battle you played:** the end menu has a **Save Replay** item, so you can keep it right away.
+
+Files: `StormReplay\replays\recent` and `StormReplay\replays\saved` next to the exe (`.nsreplay`, about 15–130 KB each),
+log `StormReplay\logs\replay.log`. Settings, in `storm4perf.ini` under `[replay]`: `enabled` (1), `auto_record` (1),
+`keep_recent` (20).
+
+How it works: a replay stores the battle setup and both players' inputs, and the game replays them, so a replay is
+the real battle again, not a video. Every frame is checked against the recording; `replay.log` says `IDENTICAL` when a
+replay matched to the end.
+
+Known limits:
+- Replays play on the same game version and FPS setting they were recorded with (Steam 1.09).
+- Online battles are not recorded yet.
+- Replays recorded with an older version of this mod may drift from the original battle in the first seconds.
+- In testing, one battle started through Character Select drifted from its first seconds when watched (replays from
+  the list's Watch Again and battles started directly matched exactly). Send `StormReplay\logs\replay.log` and the
+  replay file if you see a replay that does not match the battle.
 
 ## What it changes
 
@@ -56,16 +95,23 @@ anywhere in the game, with module and address. Every 5 minutes, and on exit, it 
 ## Compatibility
 
 - Storm 4 **Steam 1.09** only. On any other exe every fix is skipped (see the log) and the game runs unmodified.
-- Gameplay logic is not changed: only how the engine waits, plus the optional shadow levels. Online play has **not been
+- Gameplay logic is not changed: only how the engine waits, plus the optional shadow levels and the replay feature (which
+  records and replays inputs; with `[replay] enabled=0` it is off entirely). Online play has **not been
   tested** yet; if you try it, both players using the same FPS setting matters more than this mod. **30 FPS** (`fps=30` in `config.ini`, or in-game) is the mode the game logic was written for.
 - Other mods that also ship `xinput9_1_0.dll` (controller or keyboard mods): rename theirs (e.g. `xinput_other.dll`) and set
   `[xinput] forward=xinput_other.dll` in `storm4perf.ini`.
-- Mods using `steam_api64.dll` or `d3dcompiler_47.dll` proxies don't conflict.
+- Mods using `steam_api64.dll` or `d3dcompiler_47.dll` proxies don't conflict. Replays hook the game through the
+  `SteamAPI_RunCallbacks` export of whichever `steam_api64.dll` is installed (Valve's or another mod's proxy).
 
 ## Build
 
 `build.cmd` (MSVC x64 Build Tools) produces `xinput9_1_0.dll` and its `.pdb`. Set `VCVARS` to your `vcvars64.bat` if the
 Build Tools are not in `C:\BuildTools`.
+
+`storm4perf.cpp` holds the performance and shadow code. `replay/` holds the replay feature (C++20), built into the same
+DLL: `storm4perf_replay.cpp` boots it, and the rest is the replay core from the StormReplay project, copied in with
+its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4
+(BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Test Instance
 
