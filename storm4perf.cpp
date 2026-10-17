@@ -545,6 +545,7 @@ static DWORD WINAPI bg_thread(void *) {
         if (g_live && GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa) && CompareFileTime(&fa.ftLastWriteTime, &last) != 0) {
             last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
         }
+        support_tick(g_live ? 0.25f : 5.0f); support_drive_ui();
         if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
     }
 }
@@ -629,3 +630,4 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     }
     return TRUE;
 }
+
