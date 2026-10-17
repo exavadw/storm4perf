@@ -471,24 +471,17 @@ static bool install_guardfix(void) {
     // Secondary fix: FUN_1407ebec8 calls FUN_140764210(param_1, ...) where param_1 is the GUARDING player,
     // not the jutsu user. This overwrites the guarding player's action state (+0x8e4) with the opponent's
     // jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu recovery animation.
-    // NOP both 5-byte call sites so the mis-targeted cancellation never fires:
+    // NOP the 5-byte call site so the mis-targeted cancellation never fires:
     //   Matched-path call at RVA 0x1407EBF26: E8 E5 82 F7 FF (after finding sub-object state 0xe3)
-    //   Fallback call at RVA 0x1407EBF49:     E8 C0 82 F7 FF (unconditional path)
+    // Note: Ghidra showed a second call at ~0x1407EBF49 but the release binary has a JMP tail-call
+    // there instead (E9 BB 3A F8 FF), so only one call site exists in this version.
     static const uint8_t call1_e[] = { 0xE8, 0xE5, 0x82, 0xF7, 0xFF };
-    static const uint8_t call2_e[] = { 0xE8, 0xC0, 0x82, 0xF7, 0xFF };
     if (check_bytes("guardfix(call1)", 0x1407EBF26, call1_e, sizeof call1_e)) {
         uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
         if (!write_bytes("guardfix(call1)", VA(0x1407EBF26), nops5, sizeof nops5)) return false;
         s4log("guardfix: NOPped matched-path FUN_140764210 call at 0x1407EBF26");
     } else {
         s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EBF26)");
-    }
-    if (check_bytes("guardfix(call2)", 0x1407EBF4B, call2_e, sizeof call2_e)) {
-        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
-        if (!write_bytes("guardfix(call2)", VA(0x1407EBF4B), nops5, sizeof nops5)) return false;
-        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EBF4B");
-    } else {
-        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EBF4B)");
     }
 
     InterlockedIncrement64(&st_guard_nops);
@@ -505,22 +498,23 @@ static bool install_guardfix(void) {
 // timeout. Note: NSUNS4 release uses size 0x15c (not 0xcc as in Switch Trilogy).
 static volatile LONG64 st_inputfix_nops;
 static bool install_inputfix(void) {
-    // NSUNS4 1.09 uses FUN_1400abd14 helper (memset(param,0,0xcc)) called from two sites:
-    // Site 1: FUN_1400817c0 at VA 0x140081864 — bytes: 48 8D 4E 7C E8 AB A4 02 00
-    // Site 2: FUN_140081340 at VA 0x1400813E4 — bytes: 48 8D 4D 7C ... E8 2B A9 02 00
-    // NOP the 5-byte CALL at each site; the lea argument setup is harmless without the call.
-    static const uint8_t site1_pre[] = { 0x48,0x8D,0x4E,0x7C };
-    static const uint8_t site1_call[] = { 0xE8,0xAB,0xA4,0x02,0x00 };
-    static const uint8_t site2_pre[] = { 0x48,0x8D,0x4D,0x7C };
-    static const uint8_t site2_call[] = { 0xE8,0x2B,0xA9,0x02,0x00 };
-    if (!check_bytes("inputfix(site1_pre)", 0x140081860, site1_pre, sizeof site1_pre)) return false;
-    if (!check_bytes("inputfix(site1_call)", 0x140081864, site1_call, sizeof site1_call)) return false;
-    if (!check_bytes("inputfix(site2_pre)", 0x1400813DC, site2_pre, sizeof site2_pre)) return false;
-    if (!check_bytes("inputfix(site2_call)", 0x1400813E4, site2_call, sizeof site2_call)) return false;
+    // FUN_1407c02dc (ccPlayerPad::PreCtrl / ResetRequestedCommand inlined) at RVA 0x1407C034A:
+    //   48 8D 8B 28 04 00 00   lea rcx,[rbx+0x428]
+    //   33 D2                  xor edx,edx
+    //   41 B8 5C 01 00 00      mov r8d,0x15c
+    //   89 BB 24 04 00 00      mov [rbx+0x424],edi  (interleaved, harmless)
+    //   E8 1A F2 37 00         call memset
+    // NOP just the 5-byte call at RVA 0x1407C035F; the arg setup is harmless without it.
+    // Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame timeout.
+    static const uint8_t expected[] = {
+        0x48,0x8D,0x8B, 0x28,0x04,0x00,0x00, // lea rcx,[rbx+0x428]
+        0x33,0xD2,                            // xor edx,edx
+        0x41,0xB8, 0x5C,0x01,0x00,0x00        // mov r8d,0x15c
+    };
+    if (!check_bytes("inputfix(precall)", 0x1407C034A, expected, sizeof expected)) return false;
     uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("inputfix(site1)", VA(0x140081864), nops, sizeof nops)) return false;
-    if (!write_bytes("inputfix(site2)", VA(0x1400813E4), nops, sizeof nops)) return false;
-    s4log("inputfix: NOPped FUN_1400abd14 calls at 0x140081864 and 0x1400813E4 (5B each)");
+    if (!write_bytes("inputfix(call)", VA(0x1407C035F), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl memset(this+0x428,0,0x15c) call at 0x1407C035F");
     InterlockedIncrement64(&st_inputfix_nops);
     return true;
 }
