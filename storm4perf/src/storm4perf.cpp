@@ -468,20 +468,29 @@ static bool install_guardfix(void) {
     if (!write_bytes("guardfix(reset)", VA(0x14077E6E6), nops, sizeof nops)) return false;
     s4log("guardfix: NOPped DAT_141666ebc write at 0x14077E6B6 and reset at 0x14077E6E6 (8B each)");
 
-    // Secondary fix: FUN_1407ebec8 calls FUN_140764210(param_1, ...) where param_1 is the GUARDING player,
-    // not the jutsu user. This overwrites the guarding player's action state (+0x8e4) with the opponent's
-    // jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu recovery animation.
-    // NOP the 5-byte call site so the mis-targeted cancellation never fires:
-    //   Matched-path call at RVA 0x1407EBF26: E8 E5 82 F7 FF (after finding sub-object state 0xe3)
-    // Note: Ghidra showed a second call at ~0x1407EBF49 but the release binary has a JMP tail-call
-    // there instead (E9 BB 3A F8 FF), so only one call site exists in this version.
-    static const uint8_t call1_e[] = { 0xE8, 0xE5, 0x82, 0xF7, 0xFF };
-    if (check_bytes("guardfix(call1)", 0x1407EBF26, call1_e, sizeof call1_e)) {
-        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
-        if (!write_bytes("guardfix(call1)", VA(0x1407EBF26), nops5, sizeof nops5)) return false;
-        s4log("guardfix: NOPped matched-path FUN_140764210 call at 0x1407EBF26");
-    } else {
-        s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EBF26)");
+    // Secondary fix: multiple guard-hit handlers call FUN_140764210(param_1, ...) where param_1 is the
+    // GUARDING player, not the jutsu user. This overwrites the guarding player's action state (+0x8e4)
+    // with the opponent's jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu
+    // recovery animation. NOP all 5-byte call sites so the mis-targeted cancellation never fires:
+    //   FUN_1407ebec8 matched-path call at RVA 0x1407EBF26: E8 E5 82 F7 FF
+    //   FUN_1407ebec8 fallback call at RVA 0x1407EBF4B:    E8 C0 82 F7 FF
+    //   FUN_1407eb670 guard-hit handler call at RVA 0x1407EB6B7: E8 54 8B F7 FF
+    //   FUN_1407e86e0 projectile-guard handler call at RVA 0x1407E8864: E8 A7 B9 F7 FF
+    struct { const char *tag; uint64_t rva; uint8_t bytes[5]; } calls[] = {
+        { "call1", 0x1407EBF26, { 0xE8, 0xE5, 0x82, 0xF7, 0xFF } },
+        { "call2", 0x1407EBF4B, { 0xE8, 0xC0, 0x82, 0xF7, 0xFF } },
+        { "call3", 0x1407EB6B7, { 0xE8, 0x54, 0x8B, 0xF7, 0xFF } },
+        { "call4", 0x1407E8864, { 0xE8, 0xA7, 0xB9, 0xF7, 0xFF } },
+    };
+    for (int i = 0; i < 4; i++) {
+        char label[32]; _snprintf_s(label, sizeof label, _TRUNCATE, "guardfix(%s)", calls[i].tag);
+        if (check_bytes(label, calls[i].rva, calls[i].bytes, 5)) {
+            uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+            if (!write_bytes(label, VA(calls[i].rva), nops5, sizeof nops5)) return false;
+            s4log("guardfix: NOPped FUN_140764210 %s at 0x%llX", calls[i].tag, calls[i].rva);
+        } else {
+            s4log("guardfix: SKIP %s NOP (bytes differ at 0x%llX)", calls[i].tag, calls[i].rva);
+        }
     }
 
     InterlockedIncrement64(&st_guard_nops);
@@ -511,10 +520,10 @@ static bool install_inputfix(void) {
         0x33,0xD2,                            // xor edx,edx
         0x41,0xB8, 0x5C,0x01,0x00,0x00        // mov r8d,0x15c
     };
-    if (!check_bytes("inputfix(precall)", 0x1407C034A, expected, sizeof expected)) return false;
+    if (!check_bytes("inputfix(precall)", 0x1407C034E, expected, sizeof expected)) return false;
     uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("inputfix(call)", VA(0x1407C035F), nops, sizeof nops)) return false;
-    s4log("inputfix: NOPped PreCtrl memset(this+0x428,0,0x15c) call at 0x1407C035F");
+    if (!write_bytes("inputfix(call)", VA(0x1407C0363), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl memset(this+0x428,0,0x15c) call at 0x1407C0363");
     InterlockedIncrement64(&st_inputfix_nops);
     return true;
 }
