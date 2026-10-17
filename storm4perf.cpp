@@ -8,6 +8,8 @@
 // Log: storm4perf.log next to the exe (falls back to %TEMP%). Config: storm4perf.ini next to the exe (optional).
 // GPU options ([gpu] shadows=game|potato|off, also in the game's Options > Shadow Quality): storm4perf_gpu.cpp and
 // storm4perf_ui.cpp, section 4c of the doc.
+// Replays ([replay], on by default): save and watch Free Battle VS replays from a native list on the Free Battle menu.
+// The replay code is C++20 and lives in replay/ (storm4perf_replay.cpp boots it); it only hooks game functions.
 #include <windows.h>
 #include <d3d11.h>
 #include <intrin.h>
@@ -19,7 +21,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.3.0"
+#define S4P_VERSION "1.5.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -493,6 +495,7 @@ static bool install_affinity(bool timer, bool bullet) {
 
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
+extern "C" bool s4p_replay_attach(const wchar_t *dir, const wchar_t *ini);  // replay/storm4perf_replay.cpp
 
 // ================================================================ crash and error logging
 static volatile LONG st_exc;
@@ -649,6 +652,10 @@ static void startup(void) {
         if (ok) g_installed_any = 1;
     }
     install_gpu();
+    if (GetPrivateProfileIntW(L"replay", L"enabled", 1, g_ini)) {
+        bool rp = s4p_replay_attach(g_dir, g_ini);
+        s4log("%s replays (log: StormReplay\\logs\\replay.log)", rp ? "OK  " : "FAIL");
+    } else s4log("off  replays ([replay] enabled=0)");
     if (GetPrivateProfileIntW(L"gpu", L"options_menu", 1, g_ini)) {
         bool ui = install_ui();
         s4log("%s options menu (Shadow Quality: OFF / VERY LOW / LOW / MEDIUM / HIGH)", ui ? "OK  " : "FAIL");
