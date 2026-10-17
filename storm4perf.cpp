@@ -46,13 +46,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace; };
-enum { NFIX = 7 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, anim60fix; };
+enum { NFIX = 8 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "anim60fix" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; anim60fix: fixes missing keyframes at 60fps
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -394,6 +394,19 @@ static bool install_presentpace(void) {
     return write_bytes("presentpace", site, b, sizeof b);
 }
 
+// ================================================================ fix 8: anim60fix — skip extra animation pass at 60fps
+// Retail 1.09 added an extra animation update pass in nuccSys inner update (FUN_140a0aa00) gated on
+// DAT_1416663c8+0x590 != 0, calling FUN_140a09830 which advances animation time a third time per frame.
+// At 30fps this is harmless (catches up), but at 60fps it bypasses the frame-skip cadence and causes
+// keyframes to be skipped. Debug 1.06 does not have this extra pass. Fix: NOP the call when at 60fps.
+// Target: 0x140a0ad14 = E8 17 EB FF FF (call FUN_140a09830). Replace with 90 90 90 90 90 (5x NOP).
+static bool install_anim60fix(void) {
+    static const uint8_t e[] = { 0xE8, 0x17, 0xEB, 0xFF, 0xFF };  // call FUN_140a09830 at 0x140a0ad14
+    if (!check_bytes("anim60fix", 0x140a0ad14, e, sizeof e)) return false;
+    static const uint8_t nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
+    return write_bytes("anim60fix", VA(0x140a0ad14), nop5, sizeof nop5);
+}
+
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
 // timeraffinity: the QPC timer helpers pin the calling thread to CPU 0 around every read and restore it afterwards.
 //   Only those call sites (by return address) on the current-thread pseudo-handle are skipped; QPC itself is unchanged.
@@ -596,6 +609,7 @@ static void startup(void) {
             break;
         case 4: ok = install_vsyncsleep(); break;
         case 6: ok = install_presentpace(); break;
+        case 7: ok = install_anim60fix(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
