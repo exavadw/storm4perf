@@ -52,7 +52,7 @@ static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
 static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "guardfix", "audiocrash", "inputfix" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2 (DISABLED - pattern not verified for this binary)
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -472,23 +472,23 @@ static bool install_guardfix(void) {
     // not the jutsu user. This overwrites the guarding player's action state (+0x8e4) with the opponent's
     // jutsu-end animation ID, causing the jutsu attacker to skip to post-jutsu recovery animation.
     // NOP both 5-byte call sites so the mis-targeted cancellation never fires:
-    //   Matched-path call at RVA 0x1407EC26: E8 E5 82 F7 FF (after finding sub-object state 0xe3)
-    //   Fallback call at RVA 0x1407EC49:     E8 C0 82 F7 FF (unconditional path)
+    //   Matched-path call at RVA 0x1407EBF26: E8 E5 82 F7 FF (after finding sub-object state 0xe3)
+    //   Fallback call at RVA 0x1407EBF49:     E8 C0 82 F7 FF (unconditional path)
     static const uint8_t call1_e[] = { 0xE8, 0xE5, 0x82, 0xF7, 0xFF };
     static const uint8_t call2_e[] = { 0xE8, 0xC0, 0x82, 0xF7, 0xFF };
-    if (check_bytes("guardfix(call1)", 0x1407EC26, call1_e, sizeof call1_e)) {
+    if (check_bytes("guardfix(call1)", 0x1407EBF26, call1_e, sizeof call1_e)) {
         uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
-        if (!write_bytes("guardfix(call1)", VA(0x1407EC26), nops5, sizeof nops5)) return false;
-        s4log("guardfix: NOPped matched-path FUN_140764210 call at 0x1407EC26");
+        if (!write_bytes("guardfix(call1)", VA(0x1407EBF26), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped matched-path FUN_140764210 call at 0x1407EBF26");
     } else {
-        s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EC26)");
+        s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EBF26)");
     }
-    if (check_bytes("guardfix(call2)", 0x1407EC49, call2_e, sizeof call2_e)) {
+    if (check_bytes("guardfix(call2)", 0x1407EBF49, call2_e, sizeof call2_e)) {
         uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
-        if (!write_bytes("guardfix(call2)", VA(0x1407EC49), nops5, sizeof nops5)) return false;
-        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EC49");
+        if (!write_bytes("guardfix(call2)", VA(0x1407EBF49), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EBF49");
     } else {
-        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EC49)");
+        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EBF49)");
     }
 
     InterlockedIncrement64(&st_guard_nops);
