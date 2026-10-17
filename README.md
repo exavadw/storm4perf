@@ -33,8 +33,10 @@ Every **VS Battle** in **Free Battle** (against the CPU or local 2P) is recorded
 - **Actions:** **A** on a replay: **Watch**, **Save** (Recent only; moves it to Saved), **Delete**, **Back**.
 - **While watching:** **Start** opens the pause menu with **Restart Replay**, **Playback Speed** (1/4x, 1/2x, 1x, 2x, 4x),
   **Frame Advance**, **HUD Display**, **Save Replay** (for Recent replays), the command and combo lists, and
-  **Return to Replays**. With frame advance on, **RB** steps one frame. Your controller does not affect the replay.
+  **Return to Replays**. With frame advance on, **RB** steps one frame forward; the game stays rendered (no black screen)
+  and you can restart the replay without crashing. Your controller does not affect the replay.
 - **After a replay:** **Watch Again** or **Return to Replays**.
+- **After saving:** the confirmation message reads once and does not re-trigger when selected again.
 - **After a battle you played:** the end menu has a **Save Replay** item, so you can keep it right away.
 
 Files: `StormReplay\replays\recent` and `StormReplay\replays\saved` next to the exe (`.nsreplay`, about 15–130 KB each),
@@ -121,6 +123,16 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 - **Assets:** junctions to Steam install (data/dlc)
 
 ## Bug Fix History
+
+### Replay workflow fixes (v1.6.0)
+
+**Bug 1 — Save prompt repeats:** After saving a replay, selecting "Replay Saved" again re-triggered the save. Fixed by guarding the save callback with `g_save == SaveState::Offer` so it fires only once.
+
+**Bug 2 — Save text in prompt:** The post-save prompt included "Replay Saved" as a selectable item. Changed the registered text to a descriptive message ("The replay has been saved to Saved Replays.") that displays as feedback rather than an actionable choice.
+
+**Bug 3 — Frame advance black screen:** Enabling Frame Advance during replay playback caused a black screen and frozen controls. Root cause: `push_pause()` used flag `0x80001` which includes the render-freeze bit (`0x80000`). Changed to `0x1` (logic pause only) so the render pipeline keeps presenting frames while logic is paused for stepping.
+
+**Bug 4 — Frame advance restart crash:** Restarting a replay while Frame Advance was active crashed the game. The pause stack accumulated without being cleared on replay restart. Added a reset in `tick()` that drains all outstanding pauses when viewing transitions from true to false, ensuring clean state on restart.
 
 ### anim60fix — Dropped keyframes at 60fps (v1.3.0)
 

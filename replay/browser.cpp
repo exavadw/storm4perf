@@ -3,16 +3,23 @@
 //   Lists: Saved and Recent (L1/R1), newest first, pages of kPageRows with Next/Previous Page rows; the highlighted row's
 //   details (stage, rounds, winner, length, date) in the native help bar; ★ marks the winning leader.
 //   Row → Watch / Save (Recent only; Saved holds kSavedCap and never trims itself) / Delete / Back.
-#include "browser.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
+// Force-include C++20 STL headers before windows.h to prevent MSVC from mis-parsing std::format/string_view
+// when windows.h macros (even with NOMINMAX) interfere with template argument parsing in transitive includes.
+#include <format>
+#include <string>
+#include <string_view>
+
+#include "browser.h"
 #include <windows.h>
 #include <xinput.h>
 
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
-#include <format>
-#include <string>
 #include <vector>
 
 #include "game.h"
@@ -230,7 +237,7 @@ void show_actions(int tab, size_t index) {
   g_last = e.path;
   std::string title = std::format("{}\n{}", row_text(e), detail_text(e, "\n"));
   if (team_battle(e)) title += std::format("\n{}\nvs\n{}", team_text(e, 0), team_text(e, 1));
-  text::set("rpl_act_title", title);
+  ssr::text::set("rpl_act_title", title);
   std::vector<std::string> ids{"rpl_act_play"};
   if (tab == Recent) ids.push_back("rpl_act_save");
   ids.push_back("rpl_act_delete");
@@ -267,15 +274,16 @@ void show_actions(int tab, size_t index) {
 
 void show_page(int start_row) {
   auto& list = g_entries[g_tab];
-  const int pages = std::max(1, (static_cast<int>(list.size()) + kPageRows - 1) / kPageRows);
+  const int pages = (std::max)(1, (static_cast<int>(list.size()) + kPageRows - 1) / kPageRows);
   int& page = g_page[g_tab];
-  page = std::clamp(page, 0, pages - 1);
+  page = (std::clamp)(page, 0, pages - 1);
   std::vector<std::string> ids, descs;
   std::vector<int> map;  // item → entry index, or -1 next, -2 previous, -3 nothing
-  for (int i = page * kPageRows; i < std::min<int>(static_cast<int>(list.size()), (page + 1) * kPageRows); ++i) {
+  const int end_row = std::min(static_cast<int>(list.size()), (page + 1) * kPageRows);
+  for (int i = page * kPageRows; i < end_row; ++i) {
     const std::string id = std::format("rpl_row_{}", ids.size()), desc = std::format("rpl_desc_{}", ids.size());
-    text::set(id.c_str(), row_text(list[i]));
-    text::set(desc.c_str(), detail_text(list[i]));
+    ssr::text::set(id.c_str(), row_text(list[i]));
+    ssr::text::set(desc.c_str(), detail_text(list[i]));
     ids.push_back(id);
     descs.push_back(desc);
     map.push_back(i);
@@ -286,11 +294,11 @@ void show_page(int start_row) {
   const int count = static_cast<int>(list.size());
   const std::string counter = g_tab == Saved ? std::format("{}/{}", count, replay::kSavedCap) : std::format("{}/{}", count, replay::keep_recent());
   const std::string pager = pages > 1 ? std::format("   Page {}/{}", page + 1, pages) : std::string();
-  text::set("rpl_browser_title", std::format("<icon btn_l1 />  {} Replays  {}  <icon btn_r1 />{}", g_tab == Saved ? "Saved" : "Recent", counter, pager));
+  ssr::text::set("rpl_browser_title", std::format("<icon btn_l1 />  {} Replays  {}  <icon btn_r1 />{}", g_tab == Saved ? "Saved" : "Recent", counter, pager));
   ui::Options o;
   o.title_id = "rpl_browser_title";
   o.desc_ids = descs;
-  o.start_row = std::clamp(start_row, 0, static_cast<int>(ids.size()) - 1);
+  o.start_row = (std::clamp)(start_row, 0, static_cast<int>(ids.size()) - 1);
   g_list_open = true;
   ui::open(ids, [map](int c) {
     g_list_open = false;
@@ -348,33 +356,33 @@ void install() {
       g_child_ids.push_back(id);
   }
   log::info("browser: host scene {} with {} child scenes", g_host_id, g_child_ids.size());
-  text::set("rpl_act_play", "Watch");
-  text::set("rpl_act_save", "Save");
-  text::set("rpl_act_delete", "Delete");
-  text::set("rpl_act_play_desc", "Watch this replay.");
-  text::set("rpl_act_save_desc", "Keep this replay in Saved Replays.");
-  text::set("rpl_act_delete_desc", "Delete this replay.");
-  text::set("rpl_act_back_desc", "Return to the replay list.");
-  text::set("rpl_next_page", "Next Page");
-  text::set("rpl_prev_page", "Previous Page");
-  text::set("rpl_next_page_desc", "Show older replays.");
-  text::set("rpl_prev_page_desc", "Show newer replays.");
-  text::set("rpl_none", "No Replays");
-  text::set("rpl_none_desc", "Battles you fight in VS Battle are recorded here.");
-  text::set("rpl_saved_full_q", "Saved replays are full. Delete the oldest saved replay to make room?");
-  text::set("rpl_err_saved_full", "Saved replays are full. Delete one in Replays first.");
-  text::set("rpl_saved_full_item", "Saved Replays Full");
-  text::set("rpl_delete_q", "Delete this replay?");
-  text::set("rpl_empty", "There are no replays yet.");
-  text::set("rpl_save_replay", "Save Replay");
-  text::set("rpl_replay_saved", "Replay Saved");
-  text::set("rpl_start_vs", "Start a VS Battle. It will load as this replay.");
-  text::set("rpl_err_busy", "A replay is already in progress.");
-  text::set("rpl_err_read", "This replay could not be read.");
-  text::set("rpl_err_version", "This replay was recorded on a different version of the game.");
-  text::set("rpl_err_fps", "This replay was recorded with a different frame rate setting.");
-  text::set("rpl_err_write", "The replay could not be saved.");
-  text::set("rpl_err_nothing", "There is no battle to save.");
+  ssr::text::set("rpl_act_play", "Watch");
+  ssr::text::set("rpl_act_save", "Save");
+  ssr::text::set("rpl_act_delete", "Delete");
+  ssr::text::set("rpl_act_play_desc", "Watch this replay.");
+  ssr::text::set("rpl_act_save_desc", "Keep this replay in Saved Replays.");
+  ssr::text::set("rpl_act_delete_desc", "Delete this replay.");
+  ssr::text::set("rpl_act_back_desc", "Return to the replay list.");
+  ssr::text::set("rpl_next_page", "Next Page");
+  ssr::text::set("rpl_prev_page", "Previous Page");
+  ssr::text::set("rpl_next_page_desc", "Show older replays.");
+  ssr::text::set("rpl_prev_page_desc", "Show newer replays.");
+  ssr::text::set("rpl_none", "No Replays");
+  ssr::text::set("rpl_none_desc", "Battles you fight in VS Battle are recorded here.");
+  ssr::text::set("rpl_saved_full_q", "Saved replays are full. Delete the oldest saved replay to make room?");
+  ssr::text::set("rpl_err_saved_full", "Saved replays are full. Delete one in Replays first.");
+  ssr::text::set("rpl_saved_full_item", "Saved Replays Full");
+  ssr::text::set("rpl_delete_q", "Delete this replay?");
+  ssr::text::set("rpl_empty", "There are no replays yet.");
+  ssr::text::set("rpl_save_replay", "Save Replay");
+  ssr::text::set("rpl_replay_saved", "The replay has been saved to Saved Replays.");
+  ssr::text::set("rpl_start_vs", "Start a VS Battle. It will load as this replay.");
+  ssr::text::set("rpl_err_busy", "A replay is already in progress.");
+  ssr::text::set("rpl_err_read", "This replay could not be read.");
+  ssr::text::set("rpl_err_version", "This replay was recorded on a different version of the game.");
+  ssr::text::set("rpl_err_fps", "This replay was recorded with a different frame rate setting.");
+  ssr::text::set("rpl_err_write", "The replay could not be saved.");
+  ssr::text::set("rpl_err_nothing", "There is no battle to save.");
 }
 
 void set_launcher(std::function<bool()> launch) { g_launch = std::move(launch); }
