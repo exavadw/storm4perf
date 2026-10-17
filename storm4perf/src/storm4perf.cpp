@@ -481,8 +481,11 @@ static bool install_guardfix(void) {
         { "call2", 0x1407EBF4B, { 0xE8, 0xC0, 0x82, 0xF7, 0xFF } },
         { "call3", 0x1407EB6B7, { 0xE8, 0x54, 0x8B, 0xF7, 0xFF } },
         { "call4", 0x1407E8864, { 0xE8, 0xA7, 0xB9, 0xF7, 0xFF } },
+        // FUN_140787a84 collision handler types 0x12/0x1E (guard-hit): cross-player state sync
+        { "call5", 0x14078854F, { 0xE8, 0xBC, 0xBC, 0xFD, 0xFF } },  // opponent->self
+        { "call6", 0x140788572, { 0xE8, 0x99, 0xBC, 0xFD, 0xFF } },  // self->opponent
     };
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         char label[32]; _snprintf_s(label, sizeof label, _TRUNCATE, "guardfix(%s)", calls[i].tag);
         if (check_bytes(label, calls[i].rva, calls[i].bytes, 5)) {
             uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
@@ -491,6 +494,29 @@ static bool install_guardfix(void) {
         } else {
             s4log("guardfix: SKIP %s NOP (bytes differ at 0x%llX)", calls[i].tag, calls[i].rva);
         }
+    }
+
+    // Tertiary fix: the root cause is that FUN_1407aebf8 and FUN_1407af4c4 call FUN_1407ebec8(opponent)
+    // which propagates the opponent's state into the jutsu attacker's +0x8e4 field via FUN_140764210.
+    // NOPping internal FUN_140764210 calls wasn't sufficient because the vtable+0x18 dispatch inside
+    // FUN_1407ebec8 also corrupts state. NOP the entire FUN_1407ebec8 call at both caller sites:
+    //   Site A: FUN_1407aebf8 at VA 0x1407AEFB1: E8 12 CF 03 00 (call FUN_1407ebec8)
+    //   Site B: FUN_1407af4c4 at VA 0x1407AF59D: E8 26 C9 03 00 (call FUN_1407ebec8)
+    static const uint8_t ebec8_a[] = { 0xE8, 0x12, 0xCF, 0x03, 0x00 };
+    static const uint8_t ebec8_b[] = { 0xE8, 0x26, 0xC9, 0x03, 0x00 };
+    if (check_bytes("guardfix(ebec8_a)", 0x1407AEFB1, ebec8_a, sizeof ebec8_a)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(ebec8_a)", VA(0x1407AEFB1), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped FUN_1407ebec8 call in FUN_1407aebf8 at 0x1407AEFB1");
+    } else {
+        s4log("guardfix: SKIP ebec8_a NOP (bytes differ at 0x1407AEFB1)");
+    }
+    if (check_bytes("guardfix(ebec8_b)", 0x1407AF59D, ebec8_b, sizeof ebec8_b)) {
+        uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
+        if (!write_bytes("guardfix(ebec8_b)", VA(0x1407AF59D), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped FUN_1407ebec8 call in FUN_1407af4c4 at 0x1407AF59D");
+    } else {
+        s4log("guardfix: SKIP ebec8_b NOP (bytes differ at 0x1407AF59D)");
     }
 
     InterlockedIncrement64(&st_guard_nops);
