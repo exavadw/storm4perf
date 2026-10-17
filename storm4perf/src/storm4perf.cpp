@@ -528,28 +528,24 @@ static bool install_guardfix(void) {
 // to clear the command request buffer every frame BEFORE input processing. When fast input occurs, the
 // chakra dash/jutsu command is wiped before the state machine polls IsRequestedCommand, causing silent
 // failure despite chakra already being deducted.
-// Fix: NOP the 5-byte call to memset at RVA 0x1407C035F. The preceding lea/xor/mov setup is harmless
-// without the call. Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame
-// timeout. Note: NSUNS4 release uses size 0x15c (not 0xcc as in Switch Trilogy).
+// Root cause (verified via Ghidra decompilation of FUN_1407c0fd4 = ccPlayerPad::PreCtrl):
+// PreCtrl unconditionally clears the command request buffer (memset(this+0x428,0,0x15c)) every
+// frame BEFORE Ctrl processes new inputs. If the state machine doesn't consume a command in the
+// same frame it was set (e.g., during recovery frames), it's lost forever next frame.
+// Fix: NOP both memset calls inside FUN_1407c0fd4 so commands persist across frames.
+// Safe because UpdateSuccessCommand has a 5-frame timeout preventing stuck inputs.
+// Site 1 (if-branch): VA 0x1407C0FF5: E8 88 E5 37 00 (call memset)
+// Site 2 (else-branch): VA 0x1407C104D: E8 30 E5 37 00 (call memset)
 static volatile LONG64 st_inputfix_nops;
 static bool install_inputfix(void) {
-    // FUN_1407c02dc (ccPlayerPad::PreCtrl / ResetRequestedCommand inlined) at RVA 0x1407C034A:
-    //   48 8D 8B 28 04 00 00   lea rcx,[rbx+0x428]
-    //   33 D2                  xor edx,edx
-    //   41 B8 5C 01 00 00      mov r8d,0x15c
-    //   89 BB 24 04 00 00      mov [rbx+0x424],edi  (interleaved, harmless)
-    //   E8 1A F2 37 00         call memset
-    // NOP just the 5-byte call at RVA 0x1407C035F; the arg setup is harmless without it.
-    // Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame timeout.
-    static const uint8_t expected[] = {
-        0x48,0x8D,0x8B, 0x28,0x04,0x00,0x00, // lea rcx,[rbx+0x428]
-        0x33,0xD2,                            // xor edx,edx
-        0x41,0xB8, 0x5C,0x01,0x00,0x00        // mov r8d,0x15c
-    };
-    if (!check_bytes("inputfix(precall)", 0x1407C034E, expected, sizeof expected)) return false;
+    static const uint8_t site1_e[] = { 0xE8, 0x88, 0xE5, 0x37, 0x00 };
+    static const uint8_t site2_e[] = { 0xE8, 0x30, 0xE5, 0x37, 0x00 };
+    if (!check_bytes("inputfix(site1)", 0x1407C0FF5, site1_e, sizeof site1_e)) return false;
+    if (!check_bytes("inputfix(site2)", 0x1407C104D, site2_e, sizeof site2_e)) return false;
     uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("inputfix(call)", VA(0x1407C0363), nops, sizeof nops)) return false;
-    s4log("inputfix: NOPped PreCtrl memset(this+0x428,0,0x15c) call at 0x1407C0363");
+    if (!write_bytes("inputfix(site1)", VA(0x1407C0FF5), nops, sizeof nops)) return false;
+    if (!write_bytes("inputfix(site2)", VA(0x1407C104D), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl memset calls at 0x1407C0FF5 and 0x1407C104D");
     InterlockedIncrement64(&st_inputfix_nops);
     return true;
 }
