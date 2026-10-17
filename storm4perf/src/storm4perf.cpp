@@ -52,7 +52,7 @@ static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
 static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "guardfix", "audiocrash", "inputfix" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2 (DISABLED - pattern not verified for this binary)
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; guardfix: bug 1; audiocrash: device unplug crash; inputfix: bug 2
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -483,12 +483,12 @@ static bool install_guardfix(void) {
     } else {
         s4log("guardfix: SKIP call1 NOP (bytes differ at 0x1407EBF26)");
     }
-    if (check_bytes("guardfix(call2)", 0x1407EBF49, call2_e, sizeof call2_e)) {
+    if (check_bytes("guardfix(call2)", 0x1407EBF4B, call2_e, sizeof call2_e)) {
         uint8_t nops5[5]; memset(nops5, 0x90, sizeof nops5);
-        if (!write_bytes("guardfix(call2)", VA(0x1407EBF49), nops5, sizeof nops5)) return false;
-        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EBF49");
+        if (!write_bytes("guardfix(call2)", VA(0x1407EBF4B), nops5, sizeof nops5)) return false;
+        s4log("guardfix: NOPped fallback FUN_140764210 call at 0x1407EBF4B");
     } else {
-        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EBF49)");
+        s4log("guardfix: SKIP call2 NOP (bytes differ at 0x1407EBF4B)");
     }
 
     InterlockedIncrement64(&st_guard_nops);
@@ -496,29 +496,27 @@ static bool install_guardfix(void) {
 }
 
 // ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
-// ccPlayerPad::PreCtrl() unconditionally clears the command request buffer via FUN_1400abd14 (which does
-// memset(param_1, 0, 0xcc)) every frame BEFORE input processing. In NSUNS4 1.09 the compiler emits this
-// as a helper call rather than an inline memset, and the buffer lives at this+0x7c (not 0x428 as on Switch).
-// Two call sites exist: FUN_1400817c0 at VA 0x140081864 and FUN_140081340 at VA 0x1400813e4.
-// Fix: NOP the 5-byte CALL at each site. The lea rcx,[reg+0x7c] argument setup is harmless without the call.
-// Commands will persist one extra frame, safe because UpdateSuccessCommand has a 5-frame timeout.
+// FUN_1407c02dc (ccPlayerPad::PreCtrl / ResetRequestedCommand inlined) calls memset(this+0x428, 0, 0x15c)
+// to clear the command request buffer every frame BEFORE input processing. When fast input occurs, the
+// chakra dash/jutsu command is wiped before the state machine polls IsRequestedCommand, causing silent
+// failure despite chakra already being deducted.
+// Fix: NOP the 5-byte call to memset at RVA 0x1407C035F. The preceding lea/xor/mov setup is harmless
+// without the call. Commands persist one extra frame; safe because UpdateSuccessCommand has a 5-frame
+// timeout. Note: NSUNS4 release uses size 0x15c (not 0xcc as in Switch Trilogy).
 static volatile LONG64 st_inputfix_nops;
 static bool install_inputfix(void) {
-    // Site 1: FUN_1400817c0 calls FUN_1400abd14 at VA 0x140081864
-    // Bytes: 48 8D 4E 7C E8 AB A4 02 00  (lea rcx,[rsi+0x7c]; call FUN_1400abd14)
-    static const uint8_t site1_pre[] = { 0x48,0x8D,0x4E,0x7C };  // lea rcx,[rsi+0x7c]
+    // NSUNS4 1.09 uses FUN_1400abd14 helper (memset(param,0,0xcc)) called from two sites:
+    // Site 1: FUN_1400817c0 at VA 0x140081864 — bytes: 48 8D 4E 7C E8 AB A4 02 00
+    // Site 2: FUN_140081340 at VA 0x1400813E4 — bytes: 48 8D 4D 7C ... E8 2B A9 02 00
+    // NOP the 5-byte CALL at each site; the lea argument setup is harmless without the call.
+    static const uint8_t site1_pre[] = { 0x48,0x8D,0x4E,0x7C };
     static const uint8_t site1_call[] = { 0xE8,0xAB,0xA4,0x02,0x00 };
-    // Site 2: FUN_140081340 calls FUN_1400abd14 at VA 0x1400813e4
-    // Bytes: 48 8D 4D 7C E8 2B A9 02 00  (lea rcx,[rbp+0x7c]; call FUN_1400abd14)
-    static const uint8_t site2_pre[] = { 0x48,0x8D,0x4D,0x7C };  // lea rcx,[rbp+0x7c]
+    static const uint8_t site2_pre[] = { 0x48,0x8D,0x4D,0x7C };
     static const uint8_t site2_call[] = { 0xE8,0x2B,0xA9,0x02,0x00 };
-
     if (!check_bytes("inputfix(site1_pre)", 0x140081860, site1_pre, sizeof site1_pre)) return false;
     if (!check_bytes("inputfix(site1_call)", 0x140081864, site1_call, sizeof site1_call)) return false;
-    // Site 2: lea rcx,[rbp+0x7c] is at 0x1400813DC, followed by "mov [rbp+0x44],ax" (66 89 45 44) before the call
     if (!check_bytes("inputfix(site2_pre)", 0x1400813DC, site2_pre, sizeof site2_pre)) return false;
     if (!check_bytes("inputfix(site2_call)", 0x1400813E4, site2_call, sizeof site2_call)) return false;
-
     uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
     if (!write_bytes("inputfix(site1)", VA(0x140081864), nops, sizeof nops)) return false;
     if (!write_bytes("inputfix(site2)", VA(0x1400813E4), nops, sizeof nops)) return false;
