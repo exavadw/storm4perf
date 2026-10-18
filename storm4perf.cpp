@@ -51,13 +51,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix; };
-enum { NFIX = 10 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, inputfix; };
+enum { NFIX = 11 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps; guardfix: prevents guard-hit from cancelling other players' jutsu
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "inputfix" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps; guardfix/inputfix: game-bug fixes, off until verified in game (see storm4perf.ini)
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -516,6 +516,26 @@ static bool install_affinity(bool timer, bool bullet) {
     return true;
 }
 
+// ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
+// FUN_1407c0fd4 (ccPlayerPad::PreCtrl) calls memset(this+0x428, 0, 0x15c) to clear the command request buffer
+// every frame BEFORE input processing. When fast input occurs, the chakra dash/jutsu command is wiped before
+// the state machine polls IsRequestedCommand, causing silent failure despite chakra already being deducted.
+// Fix: NOP both memset calls inside FUN_1407c0fd4 so commands persist across frames.
+// Safe because UpdateSuccessCommand has a 5-frame timeout preventing stuck inputs.
+// Site 1 (if-branch): VA 0x1407C0FF5: E8 88 E5 37 00 (call memset)
+// Site 2 (else-branch): VA 0x1407C104D: E8 30 E5 37 00 (call memset)
+static bool install_inputfix(void) {
+    static const uint8_t site1_e[] = { 0xE8, 0x88, 0xE5, 0x37, 0x00 };
+    static const uint8_t site2_e[] = { 0xE8, 0x30, 0xE5, 0x37, 0x00 };
+    if (!check_bytes("inputfix(site1)", 0x1407C0FF5, site1_e, sizeof site1_e)) return false;
+    if (!check_bytes("inputfix(site2)", 0x1407C104D, site2_e, sizeof site2_e)) return false;
+    uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
+    if (!write_bytes("inputfix(site1)", VA(0x1407C0FF5), nops, sizeof nops)) return false;
+    if (!write_bytes("inputfix(site2)", VA(0x1407C104D), nops, sizeof nops)) return false;
+    s4log("inputfix: NOPped PreCtrl memset calls at 0x1407C0FF5 and 0x1407C104D");
+    return true;
+}
+
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
 #include "storm4perf_guardfix.cpp"
@@ -696,6 +716,7 @@ static void startup(void) {
         case 7: ok = install_inputdelay(); break;
         case 8: ok = install_anim60fix(); break;
         case 9: ok = install_guardfix(); break;
+        case 10: ok = install_inputfix(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
