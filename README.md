@@ -70,21 +70,21 @@ Known limits:
 | `vsyncsleep` | VSync callback thread spins with `Sleep(0)` for 2 ms every 16.7 ms | sleeps toward its deadline |
 | `bulletunpin` (off by default) | pins the 4 physics workers to CPUs 0–3 | leaves them to Windows (no measurable effect, so it stays off) |
 | `presentpace` (off by default) | with in-game vsync on, spins with `Sleep(0)` after every Present until the frame time is up | sleeps on a high-resolution timer, wakes 2 ms early at time-critical priority, then spins the rest. Saves ~0.8 core with vsync on, but cost 1–3 FPS in 3 of 8 runs, all in one 30-minute window while other heavy programs ran |
-| `anim60fix` | Retail 1.09 added a global timer throttle in the character state machine that causes dropped keyframes at 60fps | NOPs the throttle check so animations update every frame as intended |
 
-### Experimental game-bug fixes (off by default)
+### Game-bug fixes
 
-New in 1.7.0, under `[fixes]` in `storm4perf.ini`. Each one patches out a call in the game's code for a
-community-reported bug. They load and patch correctly, but **none has been confirmed in game yet** to fix its bug
-without side effects, so they ship off. Set one to `1` to try it, and report what you see together with
-`storm4perf.log`.
+Under `[fixes]` in `storm4perf.ini`. `guardfix` and `audiocrash` are verified in game and **on by default**; the two
+`anim60fix` keys are experimental and off.
 
-| key | bug | what it patches |
+| key | bug | what storm4perf does |
 |---|---|---|
-| `guardfix` | a kunai or item hitting one player's guard ends the *other* player's running jutsu (e.g. Rasengan) | skips the jutsu-cancel check the guard-hit code runs on the opponent |
-| `inputfix` | a jutsu or chakra dash entered very quickly does not come out although chakra is used | stops `ccPlayerPad::PreCtrl` clearing the command buffer every frame |
-| `audiocrash` | unplugging or switching the audio device mid-game crashes the game | skips the call on the dead voice; the game stays up but silent until restarted |
-| `anim60fix_extra` | animation at 60 FPS (second part) | also skips a Retail-only extra animation pass; `anim60fix` itself stays on |
+| `guardfix` (on) | a shuriken you threw is guarded while your next jutsu runs (e.g. Rasengan), and the jutsu ends without reaching the opponent | the guard-hit code marks the thrower's current attack as guarded; with the fix only when the guarded hit came from that attack. Verified in game; replays stay identical |
+| `audiocrash` (on) | unplugging or switching the audio device mid-game crashes the game | skips the call on the dead voice. Verified in game: the game shows its own XAudio2 error message and keeps running, silent until restarted |
+| `anim60fix` (off) | choppy animation at 60 FPS | skips a Retail-only animation throttle (JL at `0x1403f68d6`). Measured in game: that code never runs in a battle at 30 or 60 FPS, so it changes nothing there. On by default until 1.7.0 |
+| `anim60fix_extra` (off) | choppy animation at 60 FPS (second part) | with `anim60fix=1`, also skips a Retail-only extra animation pass (`0x140a0ad14`); measured the same way, it never runs in a battle |
+
+1.7.0 also had an `inputfix` key (fast jutsu / chakra-dash inputs dropped). It only changed a block the CPU AI uses, so it
+could not affect player input, and it is removed.
 
 ## Shadow levels in the Options screen
 
@@ -135,6 +135,18 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 
 ## Bug Fix History
 
+### 1.8.0
+
+- `guardfix` (now on by default) is a new, verified fix: a shuriken you threw that is guarded while your next jutsu
+  runs (e.g. Sage Naruto's air shuriken, then Rasengan on landing) no longer ends that jutsu without contact. The
+  guard-hit code (`0x140788B4C`) marked the thrower's current attack as guarded (`SetAttackResult 0x1407824B8`, result
+  at `+0x14054`); it now does that only when the guarded hit's attack id matches the thrower's current attack. The old
+  guardfix patches (calls to `0x1407EBEC8`) never ran in these battles and are gone. Replays stay identical. Showcase
+  replay: `docs/replays/guardfix-showcase.nsreplay`.
+- `audiocrash` is on by default (verified in game).
+- `inputfix` is removed: it only changed the CPU AI's request block, never player input.
+- `anim60fix` is off by default: measured in game, its code never runs in a battle at 30 or 60 FPS.
+
 ### 1.7.0
 
 - Replays: after saving from the end menu, the menu no longer offers "Replay Saved" (selecting it used to repeat the
@@ -144,12 +156,14 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 - Replays: **Import Replays** on the Saved tab.
 - Experimental, off by default: `guardfix`, `inputfix`, `audiocrash`, `anim60fix_extra` (see above).
 
-### anim60fix: dropped keyframes at 60 FPS (1.3.0)
+### anim60fix (1.3.0; off by default since 1.8.0)
 
-Retail 1.09 added a global static timer throttle (`DAT_1415da7d0`) in the character state machine (`FUN_1403f6820`;
-Debug 1.06's `FUN_14044c8c0` has none), so all characters' animation updates share one cadence. The fix NOPs the `JL`
-at VA `0x1403f68d6`. Skipping the extra animation pass at `0x140a0ad14` is now the separate, off-by-default
-`anim60fix_extra`.
+`anim60fix` NOPs the `JL` at VA `0x1403f68d6`, a Retail-only throttle (`DAT_1415da7d0`) in the character state machine
+`FUN_1403f6820` (Debug 1.06's `FUN_14044c8c0` has none); `anim60fix_extra` NOPs the call at `0x140a0ad14`. Both were
+meant to fix choppy animation at 60 FPS. Measured in game (Free Battle, full battles at 30 and 60 FPS, patches off):
+neither code path ever runs in a battle (`DAT_1415da7d0`/`DAT_1415da7d4` and the gate `nuccSys+0x590` stay 0), so
+they don't change battle animation, and the cause at 60 FPS is still open. They remain as opt-in keys because story
+mode and cutscenes were not measured.
 
 ## References
 

@@ -24,7 +24,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.7.0"
+#define S4P_VERSION "1.8.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -51,13 +51,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, inputfix, audiocrash; };
-enum { NFIX = 12 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash; };
+enum { NFIX = 11 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "inputfix", "audiocrash" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps; guardfix/inputfix/audiocrash: game-bug fixes, off until verified in game (see storm4perf.ini)
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash: game-bug fixes verified in game (see storm4perf.ini)
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -450,7 +450,12 @@ static bool install_inputdelay(void) {
     return true;
 }
 
-// ================================================================ fix 9: anim60fix — remove two 60fps animation bugs in Retail 1.09
+// ================================================================ fix 9: anim60fix — opt-in, OFF by default since 1.8.0
+// Measured 2026-10-17 (Free Battle, full battles at 30 and 60 FPS, patch off): neither site below ever executes in
+// battle. DAT_1415da7d0 and its init flag DAT_1415da7d4 stay 0 (the param_2==7 path never runs), and the site B gate
+// nuccSys+0x590 stays 0. nuccSys+0x942 holds the fps value (30/60). So these patches do not change battle animation;
+// the cause of choppy animation at 60 FPS is still open. Not measured in story mode or cutscenes, so the keys stay.
+// Original rationale, kept for reference:
 // Bug A: FUN_1403f6820 (param_2==7) uses a global static timer (DAT_1415da7d0) to throttle character
 //   state machine updates. At 60fps the threshold doubles but the accumulator races ahead, causing
 //   uneven update cadence and dropped keyframes. Debug 1.06 FUN_14044c8c0 has no such throttle.
@@ -468,8 +473,7 @@ static bool install_anim60fix(void) {
     if (!check_bytes("anim60fix:A", 0x1403f68d6, ea, sizeof ea)) return false;
     static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
     if (!write_bytes("anim60fix:A", VA(0x1403f68d6), nop6, sizeof nop6)) return false;
-    // Bug B: NOP the extra animation pass call in nuccSys inner update. Experimental and OFF by default
-    // ([fixes] anim60fix_extra=1): not yet verified in game, and an earlier attempt at this site was reverted.
+    // Bug B: NOP the extra animation pass call in nuccSys inner update, only with [fixes] anim60fix_extra=1 too.
     if (!GetPrivateProfileIntW(L"fixes", L"anim60fix_extra", 0, g_ini)) { s4log("off  anim60fix_extra (site B; [fixes] anim60fix_extra=0)"); return true; }
     static const uint8_t eb[] = { 0xE8, 0x17, 0xEB, 0xFF, 0xFF }; // CALL FUN_140a09830
     if (!check_bytes("anim60fix:B", 0x140a0ad14, eb, sizeof eb)) return false;
@@ -549,25 +553,6 @@ static bool install_affinity(bool timer, bool bullet) {
     return true;
 }
 
-// ================================================================ fix 10: fast-input drops jutsu/chakra dash (Bug 2)
-// FUN_1407c0fd4 (ccPlayerPad::PreCtrl) calls memset(this+0x428, 0, 0x15c) to clear the command request buffer
-// every frame BEFORE input processing. When fast input occurs, the chakra dash/jutsu command is wiped before
-// the state machine polls IsRequestedCommand, causing silent failure despite chakra already being deducted.
-// Fix: NOP both memset calls inside FUN_1407c0fd4 so commands persist across frames.
-// Safe because UpdateSuccessCommand has a 5-frame timeout preventing stuck inputs.
-// Site 1 (if-branch): VA 0x1407C0FF5: E8 88 E5 37 00 (call memset)
-// Site 2 (else-branch): VA 0x1407C104D: E8 30 E5 37 00 (call memset)
-static bool install_inputfix(void) {
-    static const uint8_t site1_e[] = { 0xE8, 0x88, 0xE5, 0x37, 0x00 };
-    static const uint8_t site2_e[] = { 0xE8, 0x30, 0xE5, 0x37, 0x00 };
-    if (!check_bytes("inputfix(site1)", 0x1407C0FF5, site1_e, sizeof site1_e)) return false;
-    if (!check_bytes("inputfix(site2)", 0x1407C104D, site2_e, sizeof site2_e)) return false;
-    uint8_t nops[5]; memset(nops, 0x90, sizeof nops);
-    if (!write_bytes("inputfix(site1)", VA(0x1407C0FF5), nops, sizeof nops)) return false;
-    if (!write_bytes("inputfix(site2)", VA(0x1407C104D), nops, sizeof nops)) return false;
-    s4log("inputfix: NOPped PreCtrl memset calls at 0x1407C0FF5 and 0x1407C104D");
-    return true;
-}
 
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
@@ -610,6 +595,7 @@ static void log_stats(const char *when) {
          r ? (double)st_q_lag_sum / r : 0.0, st_q_lag_max, st_q_dropped, st_q_disjoint, st_q_err, st_flip_waits, st_aff_skipped,
          st_bullet_skipped, st_pace_waits, st_pace_sleeps, st_pace_late, st_pace_late_max_us);
     s4log("stats (%s): shadow frames forced off=%lld", when, st_shadow_frames_off);
+    s4log("stats (%s): guardfix stale guard results skipped=%lld", when, st_guard_skipped);
 }
 
 // ---------------------------------------------------------------- XInput forwarding
@@ -749,8 +735,7 @@ static void startup(void) {
         case 7: ok = install_inputdelay(); break;
         case 8: ok = install_anim60fix(); break;
         case 9: ok = install_guardfix(); break;
-        case 10: ok = install_inputfix(); break;
-        case 11: ok = install_audiocrash(); break;
+        case 10: ok = install_audiocrash(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
