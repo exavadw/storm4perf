@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 #pragma comment(lib, "synchronization.lib")  // WaitOnAddress / WakeByAddressAll
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
@@ -51,13 +52,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash; };
-enum { NFIX = 11 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash, fps60; };
+enum { NFIX = 12 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash: game-bug fixes verified in game (see storm4perf.ini)
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash", "fps60" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash: game-bug fixes verified in game (see storm4perf.ini); fps60: 60 FPS timing fixes, identical at 30
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -557,6 +558,7 @@ static bool install_affinity(bool timer, bool bullet) {
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
 #include "storm4perf_guardfix.cpp"
+#include "storm4perf_fps60.cpp"
 extern "C" bool s4p_replay_attach(const wchar_t *dir, const wchar_t *ini);  // replay/storm4perf_replay.cpp
 
 // ================================================================ crash and error logging
@@ -740,6 +742,7 @@ static void startup(void) {
         case 8: ok = install_anim60fix(); break;
         case 9: ok = install_guardfix(); break;
         case 10: ok = install_audiocrash(); break;
+        case 11: ok = install_fps60(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
