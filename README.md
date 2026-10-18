@@ -133,12 +133,15 @@ DLL: `storm4perf_replay.cpp` boots it, and the rest is the replay core from the 
 its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
-`storm-replay/` is the replay feature's development project, kept here with its history: a separate `steam_api64.dll`
-dev runtime with pipe automation and test tools (scripted inputs, memory watch/trace/snapshots, simulated audio loss),
-Windows test scripts, and the research notes in `storm-replay/docs/research/`. It is not part of the release build; its
-CMake build also needs the storm-revival-story fork snapshot (`STORM_REVIVAL_DIR`).
-
 ## Bug Fix History
+
+### 1.8.1
+
+- The replay feature's helper code (exe addresses, hooks, log, controller access, game properties, message text and
+  the game's select window) is rewritten from scratch for storm4perf; earlier versions contained pieces derived from
+  another project's runtime, whose license does not allow public redistribution. Replays work as before (verified in
+  game: list, watch, playback controls, end menu; the 1.8.0 showcase replay plays back identically).
+- The `storm-replay/` development folder is no longer part of this repository.
 
 ### 1.8.0
 

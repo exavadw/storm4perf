@@ -24,7 +24,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.8.0"
+#define S4P_VERSION "1.8.1"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -632,6 +632,9 @@ static void x_ensure(void) { InitOnceExecuteOnce(&g_xonce, x_load, NULL, NULL); 
 static volatile LONG g_virtual_pad; // 0 or 1
 static DWORD g_load_tick;           // GetTickCount() when DLL loaded
 static volatile LONG g_getstate_calls; // diagnostic: how many times GetState was called
+// Set by the replays (replay/input.cpp): sees every pad read after the system XInput and may change it (virtual pad 0
+// presses, buttons reserved for the replay controls). Returns the result to give the game.
+extern "C" DWORD (*s4p_pad_filter)(DWORD pad, void *state, DWORD result) = NULL;
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
     x_ensure();
     LONG call_n = InterlockedIncrement(&g_getstate_calls);
@@ -647,6 +650,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
             if (call_n <= 5) s4log("xinput: virtual_pad injected START+A at %lu ms", elapsed);
         }
     }
+    if (s4p_pad_filter) r = s4p_pad_filter(i, s, r);
     return r;
 }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputSetState(DWORD i, void *v) { x_ensure(); return x_set ? x_set(i, v) : ERROR_DEVICE_NOT_CONNECTED; }

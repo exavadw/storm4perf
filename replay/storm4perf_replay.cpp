@@ -1,11 +1,11 @@
 // storm4perf_replay.cpp: save and watch replays (the StormReplay core) inside storm4perf's xinput9_1_0.dll.
 // Every VS battle in Free Battle is recorded to StormReplay\replays\recent (inputs, battle setup, RNG); Y on the Free
-// Battle menu opens the native replay list. Development, tests and research: github.com/exavadw/storm-replay (private).
+// Battle menu opens the native replay list. Development, tests and research happen in a separate private project.
 //
 // Boot: storm4perf's DllMain calls s4p_replay_attach, which hooks the SteamAPI_RunCallbacks export of whatever
 // steam_api64.dll is loaded (Valve's or another mod's proxy). The game calls it once per frame on its main thread; the
 // first call installs the game hooks, every call runs the replay UI. The rest of the folder is the StormReplay core,
-// copied from that repo (runtime/src) together with the shared runtime pieces it needs (game, hooks, log, input, props).
+// copied from that repo (runtime/src); game, hooks, log, input and props are storm4perf's own small helpers.
 #include <windows.h>
 
 #include <filesystem>
@@ -19,7 +19,6 @@
 #include "log.h"
 #include "playback_ui.h"
 #include "replay.h"
-#include "runtime.h"
 #include "text.h"
 #include "ui_window.h"
 
@@ -65,11 +64,6 @@ void __cdecl hk_run_callbacks() {
 }
 }  // namespace
 
-// runtime.h: the shared sources' game-thread helpers. The core only needs the thread id.
-void post_to_game_thread(std::function<void()>) {}
-void run_game_thread_tasks() {}
-bool on_game_thread() { return GetCurrentThreadId() == g_game_tid; }
-uint32_t game_thread_id() { return g_game_tid; }
 }  // namespace ssr
 
 // Called from storm4perf's DllMain. dir = game folder, ini = storm4perf.ini. Returns false if replays could not start.

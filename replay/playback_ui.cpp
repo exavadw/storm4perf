@@ -36,7 +36,6 @@
 #include "log.h"
 #include "props.h"
 #include "replay.h"
-#include "runtime.h"
 #include "text.h"
 
 namespace ssr::playback_ui {
