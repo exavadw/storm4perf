@@ -26,7 +26,11 @@ bool armed();                // a replay is loaded and waits for its battle
 bool take_left_to_menu();    // a replay was just left with "Exit Replay" (consumes the flag)
 bool write_armed_setup();    // put the armed replay's battle setup + round count in place (direct launch)
 bool end_menu_has_save(const void* window);  // that end-menu window carries the Save Replay item (4 items)
-bool end_menu_is_replay(const void* window);  // the end menu after a replay: Watch Again / Return to Replays (2 items)
+bool end_menu_is_replay(const void* window);
+bool restart_pending();  // Restart Replay / Watch Again was chosen and that playback has not started yet
+// Validate a replay file for this game (readable, same exe, same logic fps); empty = ok, else a message id.
+struct Recording;
+std::string check_file(const std::filesystem::path& file, Recording* out = nullptr);  // the end menu after a replay: Watch Again / Return to Replays (2 items)
 inline constexpr int kSavedCap = 150;  // as Storm Generations: My Replays held 150
 int count(const char* sub);             // replays in replays/<sub>
 int keep_recent();                      // Recent keeps this many (oldest trimmed after each battle)

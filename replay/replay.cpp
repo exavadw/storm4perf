@@ -89,6 +89,7 @@ size_t g_seg = 0, g_tick = 0, g_cursor[2]{}, g_overrun = 0, g_mismatches = 0, g_
 int64_t g_first_mismatch = -1, g_first_pad_tick_skew = -1, g_resync_drift = 0;
 std::string g_first_mismatch_what, g_verdict, g_last_saved;
 uint32_t g_inits = 0, g_deletes = 0, g_restarts = 0;
+bool g_restart_pending = false;  // Restart Replay / Watch Again chosen; cleared when that playback starts
 uint32_t g_pre_fight_ticks = 0;  // duel ticks since the battle setup was applied (Begin runs a fixed count before Fight)
 Segment g_pre_snap;              // RNG on this battle's first duel tick (recorded with the battle; see Recording::pre)
 bool g_pre_have = false;
@@ -326,6 +327,7 @@ void start_playback() {
   g_next_anchor = 0;
   g_round_start = 0;
   if (!g_norestore) restore(g_play.segs[0]);
+  g_restart_pending = false;
   install_object(2);
   log::info("replay: playback started ({} ticks, {} rounds{})", g_play.hashes.size(), g_play.segs.size(), g_norestore ? ", no RNG restore" : "");
 }
@@ -577,6 +579,7 @@ PauseActionFn o_pause_action = nullptr;
 
 bool g_left_to_menu = false;
 void note_action(int action, const char* where) {
+  if (action == 2 && g_viewing) g_restart_pending = true;  // the battle restarts; playback_ui lets go of the pause stack
   if (action != 7 && action != 8) return;  // 2 = Retry / Rematch: handled at the next battle init
   if (g_mode == Mode::Recording) finish_recording(where);
   if (g_viewing && action == 8) g_left_to_menu = true;
@@ -590,7 +593,7 @@ void note_action(int action, const char* where) {
 // menu with "Replay Saved" in its place; the other indices are mapped back before the game reads them.
 // After watching a replay it has two: Watch Again / Return to Replays (or Exit Replay); index 1 maps back to the game's 2.
 const char* kEndItemsSave[] = {"MSG_Rematch", "rpl_save_replay", "battlestartmenu_006", "battlestartmenu_046"};
-const char* kEndItemsSaved[] = {"MSG_Rematch", "rpl_replay_saved", "battlestartmenu_006", "battlestartmenu_046"};
+const char* kEndItemsNative[] = {"MSG_Rematch", "battlestartmenu_006", "battlestartmenu_046"};
 const char* kEndItemsFull[] = {"MSG_Rematch", "rpl_saved_full_item", "battlestartmenu_006", "battlestartmenu_046"};
 bool g_end_fresh = false;  // the recording just finished at this end menu
 uint8_t* g_end_win = nullptr;
@@ -622,7 +625,13 @@ uintptr_t __fastcall hk_end_menu(uint8_t* scene, int sub) {
         game::at<void(__fastcall*)(void*, int, int, float, int, int)>(0x14073D860)(*game::at<void**>(0x141610160),
                                                                                 g_end_saved ? 0x14 : 0x0F, 0, 1.0f, 0, 1);
       }
-      end_menu_items(win, g_end_saved ? kEndItemsSaved : g_end_full ? kEndItemsFull : kEndItemsSave);
+      if (g_end_saved) {
+        // Saved: back to the game's own three items (no "Replay Saved" row to pick again); the decide SE confirms it.
+        end_menu_items(win, kEndItemsNative, 3);
+        g_end_win = nullptr;  // native indices from here on
+      } else {
+        end_menu_items(win, g_end_full ? kEndItemsFull : kEndItemsSave);
+      }
       game::at<void(__fastcall*)(void*)>(0x1406A4A10)(win);  // start: +0x1CC = 0, result −1
     } else {
       *reinterpret_cast<int*>(win + 0x1C8) = idx <= 0 ? idx : idx - 1;  // back to the game's 3-item indices
@@ -758,8 +767,7 @@ bool viewing() { return g_viewing; }
 bool replaying() { return g_mode == Mode::Playing && !g_play_done; }
 std::filesystem::path folder(const char* sub) { return dir(sub); }
 
-std::string arm_file(const std::filesystem::path& path) {
-  if (g_mode == Mode::Recording || (g_mode == Mode::Playing && !g_play_done)) return "rpl_err_busy";
+std::string check_file(const std::filesystem::path& path, Recording* out) {
   Recording r;
   std::string err;
   if (!read_file(path.wstring(), r, &err)) {
@@ -769,6 +777,14 @@ std::string arm_file(const std::filesystem::path& path) {
   if (r.meta.exe_sha256 != game::info().sha256) return "rpl_err_version";
   if (r.meta.fps != logic_fps()) return "rpl_err_fps";
   if (r.bsp.size() != kBspSize) return "rpl_err_read";
+  if (out) *out = std::move(r);
+  return {};
+}
+
+std::string arm_file(const std::filesystem::path& path) {
+  if (g_mode == Mode::Recording || (g_mode == Mode::Playing && !g_play_done)) return "rpl_err_busy";
+  Recording r;
+  if (std::string err = check_file(path, &r); !err.empty()) return err;
   g_play = std::move(r);
   g_play_name = path.filename().string();
   g_play_path = path;
@@ -787,6 +803,7 @@ bool take_left_to_menu() {
 
 bool end_menu_has_save(const void* window) { return window && window == g_end_win && !g_end_view; }
 bool end_menu_is_replay(const void* window) { return window && window == g_end_win && g_end_view; }
+bool restart_pending() { return g_restart_pending; }
 
 bool armed() { return g_mode == Mode::ArmedPlay && g_play.bsp.size() == kBspSize; }
 

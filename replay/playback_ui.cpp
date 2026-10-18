@@ -59,6 +59,10 @@ constexpr uintptr_t kNuccSys = 0x1416663C8;
 constexpr uintptr_t kTaskMgr = 0x1416BDA20, kPushPause = 0x140ABE450, kPopPause = 0x140ABE480, kPauseTop = 0x140ABE4D0;
 constexpr uintptr_t kHudHide = 0x1406D9230, kHudShow = 0x1406D924C;
 constexpr uintptr_t kSceneMgr = 0x1416BDA18, kSceneUpdate = 0x140AB5810, kTaskExecute = 0x140ABE320;
+// The native button guide (ccUiFlashKeyHelp *0x14161C8E8, a stack like the pause stack; browser.cpp uses it on the
+// Free Battle menu): clear 0x14066AB78, custom entry 0x14066A9A0(kh, icon, text), push 0x14066AE94, pop 0x14066AC9C.
+constexpr uintptr_t kKeyHelp = 0x14161C8E8, kKhClear = 0x14066AB78, kKhAddCustom = 0x14066A9A0, kKhPush = 0x14066AE94,
+                    kKhPop = 0x14066AC9C;
 
 template <class F> F fn(uintptr_t va) { return game::at<F>(va); }
 
@@ -177,6 +181,7 @@ void __fastcall choice_init(uint8_t* item, int) {
 void __fastcall choice_decide(uint8_t* item) {
   const Choice* c = g_items.count(item) ? g_items[item] : nullptr;
   if (!c) return;
+  if (c == &kSaveChoice && g_save != SaveState::Offer) return;  // already saved (or full): nothing to confirm again
   void* mem = fn<void*(__fastcall*)(size_t, const char*, int)>(kAlloc)(0x210, "StormReplay/playback_ui.cpp", __LINE__);
   auto* win = fn<uint8_t*(__fastcall*)(void*, const char*, int)>(kWinCtor)(mem, "confirm", 0);
   *reinterpret_cast<uint8_t**>(item + 0x48) = win;
@@ -226,7 +231,7 @@ void __fastcall hk_create_items(uint8_t* menu) {
   refresh_labels();
   std::vector<uint8_t*> items{make(0x130, 0x80, kItemRetry), choice(0x120, kSpeedChoice), choice(0x118, kStepChoice),
                               choice(0x128, kHudChoice)};
-  if (g_save != SaveState::Hidden) items.push_back(choice(0x138, kSaveChoice));
+  if (g_save == SaveState::Offer || g_save == SaveState::Full) items.push_back(choice(0x138, kSaveChoice));
   items.push_back(make(0x108, 0x90, kItemCmdList));
   items.push_back(make(0x110, 0x90, kItemComboList));
   items.push_back(make(0x140, 0x80, kItemExit));
@@ -261,9 +266,37 @@ uintptr_t __fastcall hk_update(uint8_t* sys) {
   return r;
 }
 
+// ---- on-screen controls: the native button guide while the replay plays ----
+// 0 none, 1 playing (speed keys), 2 frame advance (step keys); with the speed so a change re-pushes the labels.
+int g_kh_shown = 0;
+// The round-start UI wipes the guide shortly after the round goes live, so it is shown after 3 s of live playback, and
+// pushed again when the pause menu closes (menus replace it).
+constexpr int kKhDelayFrames = 90;
+int g_live_frames = 0;
+bool g_menu_was_open = false;
+void keyhelp_set(int want) {
+  void* kh = *game::at<void**>(kKeyHelp);
+  if (!kh || want == g_kh_shown) return;
+  if (g_kh_shown) fn<void(__fastcall*)(void*)>(kKhPop)(kh);
+  g_kh_shown = 0;
+  if (!want) return;
+  auto add = fn<void(__fastcall*)(void*, const char*, const char*)>(kKhAddCustom);
+  fn<void(__fastcall*)(void*)>(kKhClear)(kh);
+  if (want / 10 == 2) {
+    add(kh, "<icon btn_r1 />", "Next Frame");
+    add(kh, "<icon btn_4 />", "Resume");
+  } else {
+    const std::string speed = std::format("Speed {}", kSpeedNames[want % 10]);
+    add(kh, "<icon btn_l1 /><icon btn_r1 />", speed.c_str());
+    add(kh, "<icon btn_4 />", "Frame Advance");
+  }
+  fn<void(__fastcall*)(void*, int)>(kKhPush)(kh, 0);
+  g_kh_shown = want;
+}
+
 void install_text() {
   text::set("rpl_speed_desc", "Change how fast the replay plays.");
-  text::set("rpl_step_desc", "Freeze the replay and advance one frame at a time with RB.");
+  text::set("rpl_step_desc", "Freeze the replay and advance one frame at a time with RB. Y also turns it on and off.");
   text::set("rpl_hud_desc", "Show or hide the battle HUD while watching.");
   text::set("rpl_pause_save_desc", "Keep this replay in Saved Replays. Recent replays are replaced as you play.");
   text::set("rpl_opt_s025", "1/4x");
@@ -321,6 +354,7 @@ void tick() {
     }
     text::enable_overrides(viewing);
     if (!viewing) {  // battle gone: give everything back
+      keyhelp_set(0);
       while (g_our_pauses > 0) pop_pause();
       g_step = g_step_once = false;
       g_speed = 2;
@@ -335,6 +369,7 @@ void tick() {
   if (!viewing) return;
 
   const bool menu_open = pause_depth() > g_our_pauses;
+  if (menu_open) g_menu_was_open = true;
   // The viewer's pad must not reach the battle (it would skip intros/KOs and change the tick count); Start still opens
   // the pause menu, which then gets the full pad. LB/RB are our speed / frame-advance keys.
   // Once the recorded inputs are used up (end menu, Watch Again / Exit Replay) the pad is the viewer's again.
@@ -344,20 +379,28 @@ void tick() {
   g_prev_buttons = buttons;
 
   const bool transition = replay::in_transition();  // KO / round intro: no frame advance, HUD changes wait
+  // Frame advance only holds while the recorded inputs play. Once Restart Replay / Watch Again is chosen, or the replay
+  // has run out (KO, end menu), our pause layer goes: a pushed pause left under a restarting battle crashed the game.
+  const bool playing = replay::replaying() && !replay::restart_pending();
   if (g_step_once) {  // one tick ran: freeze again
     g_step_once = false;
-    if (g_step && !menu_open && !transition) push_pause();
+    if (g_step && playing && !menu_open && !transition) push_pause();
   }
-  if (!menu_open) {
-    const bool hold = g_step && !transition;
+  if (!menu_open) {  // the pause stack pops its top layer: ours is only on top while no menu is open
+    const bool hold = g_step && playing && !transition;
     if (hold && g_our_pauses == 0) push_pause();
-    if (!hold && g_our_pauses > 0) pop_pause();
+    if (!hold) while (g_our_pauses > 0) pop_pause();
+    if (playing && (pressed & XINPUT_GAMEPAD_Y)) set_step(!g_step);  // Y: frame advance on / off without the menu
     if (hold && (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) && g_our_pauses > 0) {
       pop_pause();
       g_step_once = true;
     }
-    if (!g_step && (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER)) set_speed(g_speed + 1);
-    if (!g_step && (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER)) set_speed(g_speed - 1);
+    if (playing && !g_step && (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER)) set_speed(g_speed + 1);
+    if (playing && !g_step && (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER)) set_speed(g_speed - 1);
+    // The button guide shows the keys that work right now (none during intros/KOs, where they are locked).
+    g_live_frames = !playing || transition ? 0 : g_live_frames + 1;
+    if (g_menu_was_open) keyhelp_set(0), g_menu_was_open = false;  // re-push below, on top of whatever the menu left
+    keyhelp_set(g_live_frames < kKhDelayFrames ? 0 : g_step ? 20 : 10 + g_speed);
     // The game re-shows the HUD at each round start, so a hidden HUD is re-applied every half second.
     if (transition) {
       // leave the HUD as it is until the round is under way

@@ -210,6 +210,62 @@ void scan() {
 
 void show_page(int start_row = 0);
 
+// Import: .nsreplay files put in <root>\replays\import (shared by friends, copied from another PC) are checked like a
+// Watch (readable, this game version and fps) and moved into Saved. Identical files already in Saved are skipped; a
+// different file with the same name gets a suffix. The folder is created on install so it is easy to find.
+std::string import_replays() {
+  const auto in = replay::folder("import"), out = replay::folder("saved");
+  int moved = 0, dupes = 0, bad = 0, full = 0;
+  std::error_code ec;
+  std::vector<std::filesystem::path> files;
+  for (auto& f : std::filesystem::directory_iterator(in, ec))
+    if (f.is_regular_file() && f.path().extension() == L".nsreplay") files.push_back(f.path());
+  std::sort(files.begin(), files.end());
+  auto same = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+    std::error_code e;
+    if (std::filesystem::file_size(a, e) != std::filesystem::file_size(b, e)) return false;
+    FILE *fa = _wfopen(a.c_str(), L"rb"), *fb = _wfopen(b.c_str(), L"rb");
+    bool eq = fa && fb;
+    for (int ca = 0, cb = 0; eq && (ca = fgetc(fa)) != EOF;) eq = (cb = fgetc(fb)) == ca;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return eq;
+  };
+  for (const auto& f : files) {
+    if (!replay::check_file(f).empty()) {
+      ++bad;
+      continue;
+    }
+    auto dest = out / f.filename();
+    if (std::filesystem::exists(dest, ec) && same(f, dest)) {
+      ++dupes;
+      std::filesystem::remove(f, ec);
+      continue;
+    }
+    if (replay::count("saved") >= replay::kSavedCap) {
+      ++full;
+      continue;
+    }
+    for (int n = 1; std::filesystem::exists(dest, ec); ++n) dest = out / std::format("{}-{}.nsreplay", f.stem().string(), n);
+    std::filesystem::rename(f, dest, ec);
+    if (ec) {  // another drive: copy, then remove
+      ec.clear();
+      std::filesystem::copy_file(f, dest, ec);
+      if (!ec) std::filesystem::remove(f, ec);
+    }
+    if (ec) ++bad;
+    else ++moved;
+  }
+  log::info("browser: import from {}: {} imported, {} already saved, {} unusable, {} skipped (Saved full)", in.string(), moved, dupes, bad,
+            full);
+  if (files.empty()) return "No replays to import. Put .nsreplay files in the StormReplay\\replays\\import folder next to the game.";
+  std::string msg = std::format("{} replay{} imported to Saved Replays.", moved, moved == 1 ? "" : "s");
+  if (dupes) msg += std::format(" {} already saved.", dupes);
+  if (bad) msg += std::format(" {} could not be used (damaged, or from another game version or frame rate).", bad);
+  if (full) msg += std::format(" {} left in the import folder: Saved Replays is full.", full);
+  return msg;
+}
+
 // Copy a Recent replay into Saved. Saved never trims itself: when it is full, the player decides.
 void save_entry(const Entry& e, std::function<void()> then) {
   auto copy = [path = e.path, then] {
@@ -291,6 +347,7 @@ void show_page(int start_row) {
   if (list.empty()) ids.push_back("rpl_none"), descs.push_back("rpl_none_desc"), map.push_back(-3);
   if (page + 1 < pages) ids.push_back("rpl_next_page"), descs.push_back("rpl_next_page_desc"), map.push_back(-1);
   if (page > 0) ids.push_back("rpl_prev_page"), descs.push_back("rpl_prev_page_desc"), map.push_back(-2);
+  if (g_tab == Saved) ids.push_back("rpl_import"), descs.push_back("rpl_import_desc"), map.push_back(-4);
   const int count = static_cast<int>(list.size());
   const std::string counter = g_tab == Saved ? std::format("{}/{}", count, replay::kSavedCap) : std::format("{}/{}", count, replay::keep_recent());
   const std::string pager = pages > 1 ? std::format("   Page {}/{}", page + 1, pages) : std::string();
@@ -311,6 +368,12 @@ void show_page(int start_row) {
     if (map[c] == -1) return ++g_page[g_tab], show_page();
     if (map[c] == -2) return --g_page[g_tab], show_page();
     if (map[c] == -3) return show_page();
+    if (map[c] == -4) {
+      ssr::text::set("rpl_import_result", import_replays());
+      scan();
+      g_page[Saved] = 0;
+      return ui::notice("rpl_import_result", [] { show_page(); });
+    }
     show_actions(g_tab, static_cast<size_t>(map[c]));
   }, o);
 }
@@ -369,6 +432,9 @@ void install() {
   ssr::text::set("rpl_prev_page_desc", "Show newer replays.");
   ssr::text::set("rpl_none", "No Replays");
   ssr::text::set("rpl_none_desc", "Battles you fight in VS Battle are recorded here.");
+  ssr::text::set("rpl_import", "Import Replays");
+  ssr::text::set("rpl_import_desc", "Add replays from the StormReplay\\replays\\import folder next to the game to Saved Replays.");
+  replay::folder("import");  // created now, so it is there to put files in
   ssr::text::set("rpl_saved_full_q", "Saved replays are full. Delete the oldest saved replay to make room?");
   ssr::text::set("rpl_err_saved_full", "Saved replays are full. Delete one in Replays first.");
   ssr::text::set("rpl_saved_full_item", "Saved Replays Full");
