@@ -31,13 +31,17 @@ Every **VS Battle** in **Free Battle** (against the CPU or local 2P) is recorded
   Saved keeps up to 150 until you delete them. The highlighted replay's stage, rounds, winner, length and date show in
   the help bar at the bottom; ★ marks the winner.
 - **Actions:** **A** on a replay: **Watch**, **Save** (Recent only; moves it to Saved), **Delete**, **Back**.
-- **While watching:** **Start** opens the pause menu with **Restart Replay**, **Playback Speed** (1/4x, 1/2x, 1x, 2x, 4x),
-  **Frame Advance**, **HUD Display**, **Save Replay** (for Recent replays), the command and combo lists, and
-  **Return to Replays**. With frame advance on, **RB** steps one frame forward; the game stays rendered (no black screen)
-  and you can restart the replay without crashing. Your controller does not affect the replay.
+- **Import:** put `.nsreplay` files (from a friend, or another PC) in `StormReplay\replays\import` next to the exe, then
+  pick **Import Replays** at the bottom of the Saved tab. Each file is checked; good ones move to Saved, duplicates and
+  unusable files are reported and left out.
+- **While watching:** the button guide at the bottom right shows the controls. **LB / RB** change the playback speed
+  (1/4x to 4x) and **Y** turns frame advance on. In frame advance, **RB** steps one frame and **Y** resumes playback;
+  you don't need the menu. **Start** opens the pause menu with **Restart Replay**, **Playback Speed**, **Frame Advance**,
+  **HUD Display**, **Save Replay** (for Recent replays, hidden once saved), the command and combo lists, and
+  **Return to Replays**. Restarting with frame advance on works. Your controller does not affect the replay.
 - **After a replay:** **Watch Again** or **Return to Replays**.
-- **After saving:** the confirmation message reads once and does not re-trigger when selected again.
-- **After a battle you played:** the end menu has a **Save Replay** item, so you can keep it right away.
+- **After a battle you played:** the end menu has a **Save Replay** item, so you can keep it right away. Once saved,
+  a message confirms it and the end menu returns without the Save Replay item.
 
 Files: `StormReplay\replays\recent` and `StormReplay\replays\saved` next to the exe (`.nsreplay`, about 15–130 KB each),
 log `StormReplay\logs\replay.log`. Settings, in `storm4perf.ini` under `[replay]`: `enabled` (1), `auto_record` (1),
@@ -67,6 +71,20 @@ Known limits:
 | `bulletunpin` (off by default) | pins the 4 physics workers to CPUs 0–3 | leaves them to Windows (no measurable effect, so it stays off) |
 | `presentpace` (off by default) | with in-game vsync on, spins with `Sleep(0)` after every Present until the frame time is up | sleeps on a high-resolution timer, wakes 2 ms early at time-critical priority, then spins the rest. Saves ~0.8 core with vsync on, but cost 1–3 FPS in 3 of 8 runs, all in one 30-minute window while other heavy programs ran |
 | `anim60fix` | Retail 1.09 added a global timer throttle in the character state machine that causes dropped keyframes at 60fps | NOPs the throttle check so animations update every frame as intended |
+
+### Experimental game-bug fixes (off by default)
+
+New in 1.7.0, under `[fixes]` in `storm4perf.ini`. Each one patches out a call in the game's code for a
+community-reported bug. They load and patch correctly, but **none has been confirmed in game yet** to fix its bug
+without side effects, so they ship off. Set one to `1` to try it, and report what you see together with
+`storm4perf.log`.
+
+| key | bug | what it patches |
+|---|---|---|
+| `guardfix` | a kunai or item hitting one player's guard ends the *other* player's running jutsu (e.g. Rasengan) | skips the jutsu-cancel check the guard-hit code runs on the opponent |
+| `inputfix` | a jutsu or chakra dash entered very quickly does not come out although chakra is used | stops `ccPlayerPad::PreCtrl` clearing the command buffer every frame |
+| `audiocrash` | unplugging or switching the audio device mid-game crashes the game | skips the call on the dead voice; the game stays up but silent until restarted |
+| `anim60fix_extra` | animation at 60 FPS (second part) | also skips a Retail-only extra animation pass; `anim60fix` itself stays on |
 
 ## Shadow levels in the Options screen
 
@@ -115,64 +133,23 @@ DLL: `storm4perf_replay.cpp` boots it, and the rest is the replay core from the 
 its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
-## Test Instance
-
-- **Location:** `C:\dev\agent-bugfix\game` on henry-desktop
-- **Config:** 960×540 windowed, 30 FPS, vsync off
-- **Patch:** storm4perf v1.3.0 (`xinput9_1_0.dll`)
-- **Assets:** junctions to Steam install (data/dlc)
-
 ## Bug Fix History
 
-### Replay workflow fixes (v1.6.0)
+### 1.7.0
 
-**Bug 1 — Save prompt repeats:** After saving a replay, selecting "Replay Saved" again re-triggered the save. Fixed by guarding the save callback with `g_save == SaveState::Offer` so it fires only once.
+- Replays: after saving from the end menu, the menu no longer offers "Replay Saved" (selecting it used to repeat the
+  prompt); it comes back without the Save item.
+- Replays: frame advance can be left with **Y** without opening the pause menu; restarting a replay with frame advance
+  on no longer crashes; the button guide shows the speed and frame-advance controls while watching.
+- Replays: **Import Replays** on the Saved tab.
+- Experimental, off by default: `guardfix`, `inputfix`, `audiocrash`, `anim60fix_extra` (see above).
 
-**Bug 2 — Save text in prompt:** The post-save prompt included "Replay Saved" as a selectable item. Changed the registered text to a descriptive message ("The replay has been saved to Saved Replays.") that displays as feedback rather than an actionable choice.
+### anim60fix: dropped keyframes at 60 FPS (1.3.0)
 
-**Bug 3 — Frame advance black screen:** Enabling Frame Advance during replay playback caused a black screen and frozen controls. Root cause: `push_pause()` used flag `0x80001` which includes the render-freeze bit (`0x80000`). Changed to `0x1` (logic pause only) so the render pipeline keeps presenting frames while logic is paused for stepping.
-
-**Bug 4 — Frame advance restart crash:** Restarting a replay while Frame Advance was active crashed the game. The pause stack accumulated without being cleared on replay restart. Added a reset in `tick()` that drains all outstanding pauses when viewing transitions from true to false, ensuring clean state on restart.
-
-### anim60fix — Dropped keyframes at 60fps (v1.3.0)
-
-**Bug:** Retail 1.09 drops animation keyframes when running at 60fps; Debug 1.06 plays them correctly. Effects and character animations appear choppy or skip poses.
-
-**Attempt 1 (incorrect, reverted):** NOP'd `call FUN_140a09830` at VA `0x140a0ad14`, hypothesizing that an extra animation update pass in Retail caused double-advancement of the frame-skip counter. Testing showed this did not fix the issue — the dropped keyframes persisted. The extra pass was a red herring; it only fires under specific conditions unrelated to the core timing bug.
-
-**Attempt 2 (correct, shipped as v1.3.0):** Binary comparison of `FUN_1403f6820` (Retail) vs `FUN_14044c8c0` (Debug) revealed that Retail added a global static timer throttle (`DAT_1415da7d0`) in the character state machine. This shared counter gates ALL characters' animation updates through a single cadence, causing dropped keyframes when multiple objects compete for update slots. The fix NOPs the `JL` conditional at VA `0x1403f68d6` (6 bytes → `0x90 × 6`), removing the throttle so each character's animation updates independently every frame, matching Debug 1.06 behavior. Verified working on henry-desktop test instance at 60fps.
-
-## Known Bugs Under Investigation
-
-### Bug 1: Guard-hit cancels active jutsu
-
-**Report:** A kunai projectile or item hitting a player's guard can cause other players' running jutsu (e.g. Rasengan) to prematurely end.
-
-**Hypothesis:** The guard-hit handler may be broadcasting a global "interrupt" or "hit confirm" event that doesn't properly scope to the defending player, causing unrelated active jutsu state machines on other players to reset.
-
-**RE targets:**
-- Projectile/guard collision handler
-- Jutsu state machine transition logic
-- Multiplayer event dispatch for hit confirmation
-
-### Bug 2: Fast input drops jutsu / chakra dash
-
-**Report:** Inputting a jutsu or chakra dash too fast can cause the action to not happen even though chakra was consumed.
-
-**Hypothesis:** The input buffer or command recognition window may be too tight, or there's a race between chakra deduction and action commitment where the action gets cancelled but the resource spend isn't refunded. Could also be an animation cancel window issue where a new input overrides a pending action before it fully starts.
-
-**RE targets:**
-- Input buffer / command queue processing
-- Chakra consumption vs action commit ordering
-- Animation state machine transition guards
-- Jutsu activation sequence (charge → commit → execute)
-
-## Approach
-
-1. Reproduce each bug in the test instance
-2. Identify relevant functions via Ghidra (NSUNS4 1.09 release + 1.06 debug)
-3. Patch via storm4perf proxy DLL or standalone patch
-4. Verify fix at 30 FPS
+Retail 1.09 added a global static timer throttle (`DAT_1415da7d0`) in the character state machine (`FUN_1403f6820`;
+Debug 1.06's `FUN_14044c8c0` has none), so all characters' animation updates share one cadence. The fix NOPs the `JL`
+at VA `0x1403f68d6`. Skipping the extra animation pass at `0x140a0ad14` is now the separate, off-by-default
+`anim60fix_extra`.
 
 ## References
 
