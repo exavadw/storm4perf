@@ -468,7 +468,9 @@ static bool install_anim60fix(void) {
     if (!check_bytes("anim60fix:A", 0x1403f68d6, ea, sizeof ea)) return false;
     static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
     if (!write_bytes("anim60fix:A", VA(0x1403f68d6), nop6, sizeof nop6)) return false;
-    // Bug B: NOP the extra animation pass call in nuccSys inner update
+    // Bug B: NOP the extra animation pass call in nuccSys inner update. Experimental and OFF by default
+    // ([fixes] anim60fix_extra=1): not yet verified in game, and an earlier attempt at this site was reverted.
+    if (!GetPrivateProfileIntW(L"fixes", L"anim60fix_extra", 0, g_ini)) { s4log("off  anim60fix_extra (site B; [fixes] anim60fix_extra=0)"); return true; }
     static const uint8_t eb[] = { 0xE8, 0x17, 0xEB, 0xFF, 0xFF }; // CALL FUN_140a09830
     if (!check_bytes("anim60fix:B", 0x140a0ad14, eb, sizeof eb)) return false;
     static const uint8_t nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
