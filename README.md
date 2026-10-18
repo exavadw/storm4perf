@@ -76,7 +76,7 @@ Known limits:
 
 ### Game-bug fixes
 
-Under `[fixes]` in `storm4perf.ini`. `guardfix`, `audiocrash` and `qpctimer` are verified in game and **on by default**; the two
+Under `[fixes]` in `storm4perf.ini`. `guardfix`, `audiocrash`, `qpctimer` and `fps60` are **on by default**; the two
 `anim60fix` keys are experimental and off.
 
 | key | bug | what storm4perf does |
@@ -84,6 +84,7 @@ Under `[fixes]` in `storm4perf.ini`. `guardfix`, `audiocrash` and `qpctimer` are
 | `guardfix` (on) | a shuriken you threw is guarded while your next jutsu runs (e.g. Rasengan), and the jutsu ends without reaching the opponent | the guard-hit code marks the thrower's current attack as guarded; with the fix only when the guarded hit came from that attack. Verified in game; replays stay identical |
 | `qpctimer` (on) | if a game thread is delayed for more than 100 ms in the middle of a timer read, the game clock stops for the rest of the session and the frame pacing that waits on it never finishes | replaces the game's timer (`mmTimer::GetMicroSecond`/`GetMilliSecond` and two inlined copies) with plain `QueryPerformanceCounter` time |
 | `audiocrash` (on) | unplugging or switching the audio device mid-game crashes the game | skips the call on the dead voice. Verified in game: the game shows its own XAudio2 error message and keeps running, silent until restarted |
+| `fps60` (on) | at 60 FPS some game code counts frames instead of time and runs twice as fast: the substitution (warp dodge) slow-motion lasts 117 ms instead of 238 ms, some camera moves and fades run at double speed | rescales those spots to the current FPS (no game data changed; at 30 FPS every value is the game's own). Verified in game: the substitution slow-motion is 205 ms at 60 (the rest is the engine's normal 2-frame state change, which is shorter at 60); 30 FPS unchanged. The camera and fade spots are fixed by the same rules but not measured one by one. Groups: `fps60_substitution`, `fps60_camera`, `fps60_effects` |
 | `anim60fix` (off) | choppy animation at 60 FPS | skips a Retail-only animation throttle (JL at `0x1403f68d6`). Measured in game: that code never runs in a battle at 30 or 60 FPS, so it changes nothing there. On by default until 1.7.0 |
 | `anim60fix_extra` (off) | choppy animation at 60 FPS (second part) | with `anim60fix=1`, also skips a Retail-only extra animation pass (`0x140a0ad14`); measured the same way, it never runs in a battle |
 
