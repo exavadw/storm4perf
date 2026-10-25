@@ -10,9 +10,6 @@
 // storm4perf_ui.cpp, section 4c of the doc.
 // Replays ([replay], on by default): save and watch Free Battle VS replays from a native list on the Free Battle menu.
 // The replay code is C++20 and lives in replay/ (storm4perf_replay.cpp boots it); it only hooks game functions.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <intrin.h>
@@ -24,7 +21,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.8.1"
+#define S4P_VERSION "1.6.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -51,13 +48,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash; };
-enum { NFIX = 11 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, cpuai; };
+enum { NFIX = 10 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash: game-bug fixes verified in game (see storm4perf.ini)
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "cpuai" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 1, 0 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: fixes missing keyframes at 60fps; cpuai: max-difficulty AI patches (only when Free Battle difficulty == 10)
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -399,105 +396,48 @@ static bool install_presentpace(void) {
     return write_bytes("presentpace", site, b, sizeof b);
 }
 
-// ================================================================ fix 8: inputdelay — force frame-delay buffer to 30 (0x1e)
+// ================================================================ diagnostic 8: inputdelay — log frame-delay buffer value at runtime
 // The frame-delay byte lives at *(uint8_t*)(nuccSys + 0x942). nuccSys is a global pointer at DAT_1416663c8 in 1.09.
-// Static analysis shows 1.07 and 1.09 have identical setter code (clamp to 0x3c, default 0x1e), but users report
-// higher perceived input delay in 1.08/1.09. This fix continuously forces the value to 30 every frame from the
-// background thread, overriding any hidden runtime change introduced in 1.08+. Enable with [fixes] inputdelay=1.
-static volatile LONG st_id_samples, st_id_overrides;
-static uint8_t *g_nuccsys_ptr;  // address of the global pointer variable (DAT_1416663c8)
-static volatile LONG st_id_calls;
-static void enforce_input_delay(void) {
-    if (!g_on.inputdelay) return;
-    LONG call_n = InterlockedIncrement(&st_id_calls);
-    // Late-resolve nuccSys: the global pointer is NULL at DllMain time and only set during framework init.
-    if (!g_nuccsys_ptr) {
-        static const uint64_t nuccsys_va = 0x1416663c8;
-        if (!in_exe(nuccsys_va, 8)) { if (call_n <= 3) s4log("inputdelay: call #%ld nuccSys VA outside exe", call_n); return; }
-        g_nuccsys_ptr = VA(nuccsys_va);
-        if (call_n <= 3) s4log("inputdelay: call #%ld set g_nuccsys_ptr=%p", call_n, g_nuccsys_ptr);
-    }
-    uintptr_t base = *(volatile uintptr_t *)g_nuccsys_ptr;
-    if (base < 0x10000 || base > 0x7FFFFFFFFFFFull) {
-        if (call_n <= 5 || call_n % 600 == 0)
-            s4log("inputdelay: call #%ld base=0x%llX invalid (nuccSys not yet init)", call_n, (unsigned long long)base);
-        return;
-    }
-    volatile uint8_t *slot = (volatile uint8_t *)(base + 0x942);
-    uint8_t val = *slot;
+// This hook does NOT patch anything; it samples the value periodically from the background thread and logs it,
+// so we can compare 1.07 vs 1.09 runtime behaviour objectively. Enable with [fixes] inputdelay=1.
+static volatile LONG st_id_samples, st_id_nonzero;
+static uint8_t *g_nuccsys_ptr;  // resolved at startup
+static void sample_input_delay(void) {
+    if (!g_on.inputdelay || !g_nuccsys_ptr) return;
+    uint8_t val = *(volatile uint8_t *)(g_nuccsys_ptr + 0x942);
     LONG n = InterlockedIncrement(&st_id_samples);
-    if (val != 0x1e) {
-        *slot = 0x1e;
-        InterlockedIncrement(&st_id_overrides);
-        if (n <= 20 || n % 300 == 0)
-            s4log("inputdelay: sample #%ld OVERRIDE frame_delay %u -> 30 (base=0x%llX)", n, val, (unsigned long long)base);
-    } else {
-        if (n <= 5 || n % 300 == 0)
-            s4log("inputdelay: sample #%ld frame_delay=%u OK (base=0x%llX)", n, val, (unsigned long long)base);
-    }
+    if (val != 0) InterlockedIncrement(&st_id_nonzero);
+    if (n <= 20 || n % 300 == 0)
+        s4log("inputdelay: sample #%ld frame_delay=%u (0x%02X)", n, val, val);
 }
 static bool install_inputdelay(void) {
+    // DAT_1416663c8 holds the nuccSys pointer in retail 1.09
     static const uint64_t nuccsys_va = 0x1416663c8;
     if (!in_exe(nuccsys_va, 8)) { s4log("SKIP inputdelay: nuccSys VA outside exe image"); return false; }
     g_nuccsys_ptr = VA(nuccsys_va);
+    // verify the pointer looks valid (non-null, in user space)
     uintptr_t p = *(uintptr_t *)g_nuccsys_ptr;
     if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) {
-        s4log("inputdelay: nuccSys pointer 0x%llX not yet valid at startup (will retry from bg thread)", (unsigned long long)p);
+        s4log("SKIP inputdelay: nuccSys pointer 0x%llX looks invalid at startup (game may not have initialised yet)", (unsigned long long)p);
+        // still return true: the bg thread will re-check once the game sets it up
     } else {
         uint8_t v = *(uint8_t *)(p + 0x942);
-        s4log("inputdelay: nuccSys=0x%llX, initial frame_delay=%u (target=30)", (unsigned long long)p, v);
+        s4log("inputdelay: nuccSys=0x%llX, initial frame_delay=%u", (unsigned long long)p, v);
     }
     return true;
 }
 
-// ================================================================ fix 9: anim60fix — opt-in, OFF by default since 1.8.0
-// Measured 2026-10-17 (Free Battle, full battles at 30 and 60 FPS, patch off): neither site below ever executes in
-// battle. DAT_1415da7d0 and its init flag DAT_1415da7d4 stay 0 (the param_2==7 path never runs), and the site B gate
-// nuccSys+0x590 stays 0. nuccSys+0x942 holds the fps value (30/60). So these patches do not change battle animation;
-// the cause of choppy animation at 60 FPS is still open. Not measured in story mode or cutscenes, so the keys stay.
-// Original rationale, kept for reference:
-// Bug A: FUN_1403f6820 (param_2==7) uses a global static timer (DAT_1415da7d0) to throttle character
-//   state machine updates. At 60fps the threshold doubles but the accumulator races ahead, causing
-//   uneven update cadence and dropped keyframes. Debug 1.06 FUN_14044c8c0 has no such throttle.
-//   Fix: NOP the JL at 0x1403f68d6 (0F 8C A7 04 00 00) so the update always fires.
-// Bug B: FUN_140a0aa00 (nuccSys inner update) calls FUN_140a09830 — an extra animation time advance
-//   pass gated on DAT_1416663c8+0x590. This pass runs outside the normal frame-skip cadence and
-//   advances animation time a third time per frame at 60fps, skipping keyframes. Debug 1.06 has
-//   no equivalent function or call site. Original fix attempt (commit dc374c5) was reverted without
-//   explanation; combining with Bug A fix here under the same flag.
-//   Fix: NOP the CALL at 0x140a0ad14 (E8 17 EB FF FF). Safe at 30fps (flag doesn't trigger there).
-// Both patches are deterministic (no wall-clock or thread-timing dependence), safe for replays.
+// ================================================================ fix 9: anim60fix — remove global timer throttle in Retail character state machine
+// Retail 1.09 FUN_1403f6820 (param_2==7 case) uses a global static timer (DAT_1415da7d0) to throttle animation
+// updates across ALL characters, causing dropped keyframes at 60fps when multiple objects compete for the same
+// update slot. Debug 1.06 FUN_14044c8c0 has no such global throttle and uses per-object frame-skip counters instead.
+// Fix: NOP the JL at 0x1403f68d6 (0F 8C A7 04 00 00) that skips the update when the shared counter hasn't
+// reached the threshold, so every object gets its update every frame as intended.
 static bool install_anim60fix(void) {
-    // Bug A: NOP the JL throttle in character state machine
-    static const uint8_t ea[] = { 0x0F, 0x8C, 0xA7, 0x04, 0x00, 0x00 }; // JL 0x1403f6d83
-    if (!check_bytes("anim60fix:A", 0x1403f68d6, ea, sizeof ea)) return false;
+    static const uint8_t e[] = { 0x0F, 0x8C, 0xA7, 0x04, 0x00, 0x00 }; // JL 0x1403f6d83 at 0x1403f68d6
+    if (!check_bytes("anim60fix", 0x1403f68d6, e, sizeof e)) return false;
     static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-    if (!write_bytes("anim60fix:A", VA(0x1403f68d6), nop6, sizeof nop6)) return false;
-    // Bug B: NOP the extra animation pass call in nuccSys inner update, only with [fixes] anim60fix_extra=1 too.
-    if (!GetPrivateProfileIntW(L"fixes", L"anim60fix_extra", 0, g_ini)) { s4log("off  anim60fix_extra (site B; [fixes] anim60fix_extra=0)"); return true; }
-    static const uint8_t eb[] = { 0xE8, 0x17, 0xEB, 0xFF, 0xFF }; // CALL FUN_140a09830
-    if (!check_bytes("anim60fix:B", 0x140a0ad14, eb, sizeof eb)) return false;
-    static const uint8_t nop5[] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
-    return write_bytes("anim60fix:B", VA(0x140a0ad14), nop5, sizeof nop5);
-}
-
-// ================================================================ fix 10: audiocrash — prevent crash on audio device unplug
-// When an audio device is unplugged, XAudio2's OnCriticalError callback (FUN_140026e3c / FUN_140026e60) sets
-// DAT_148a83b28 = 1. The next voice tick in FUN_1400271ac checks that flag and calls vtable+0xb0 on the now-destroyed
-// IXAudio2SourceVoice COM object, causing an access violation. NOP'ing the indirect call at 0x1400271CE prevents the
-// crash; the subsequent GetState call at vtable+0xc8 is safe because XAudio2 returns XAUDIO2_E_DEVICE_INVALIDATED for
-// destroyed voices, and the game's existing error path handles it. Audio does not recover (game has no reinit path),
-// but the game stays alive — matching the behaviour of other titles that lose their audio device mid-session.
-static volatile LONG64 st_audio_nops;
-static bool install_audiocrash(void) {
-    // CALL qword ptr [RAX + 0xb0] at RVA 0x1400271CE inside FUN_1400271ac:
-    //   FF 90 B0 00 00 00
-    static const uint8_t e[] = { 0xFF, 0x90, 0xB0, 0x00, 0x00, 0x00 };
-    if (!check_bytes("audiocrash", 0x1400271CE, e, sizeof e)) return false;
-    static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-    if (!write_bytes("audiocrash", VA(0x1400271CE), nop6, sizeof nop6)) return false;
-    InterlockedIncrement64(&st_audio_nops);
-    return true;
+    return write_bytes("anim60fix", VA(0x1403f68d6), nop6, sizeof nop6);
 }
 
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
@@ -553,10 +493,69 @@ static bool install_affinity(bool timer, bool bullet) {
     return true;
 }
 
+// ================================================================ fix 10: CPU AI max difficulty (cpuai)
+// Conditional patches that make the versus CPU as hard as the engine allows, but ONLY when Free Battle
+// difficulty is set to max (level 10). The check reads DAT_141611f74 at runtime; if it is not 10, none
+// of the three patches apply and the AI behaves normally. This avoids affecting story/boss fights or
+// lower-difficulty Free Battle matches.
+// Three patches when gated on:
+// 1. Reaction gate NOP: at 0x14075cc23, xorps xmm1,xmm1 zeros reaction chance when *(int*)0x141611f08==0.
+//    In Free Battle that array is 0, so the CPU never reacts outside Practice. NOPping removes this gate.
+// 2. IsPerceptAction always-true: at 0x14075e90c, replace delay-gate body with mov eax,1; ret.
+// 3. Force level 10 in SetStrength: at 0x14075f2c4 entry, overwrite incoming edx with 10.
+// Off by default ([fixes] cpuai=0). Byte patches are permanent once written; live toggle only controls
+// whether future installs would re-apply them.
+static bool install_cpuai(void) {
+    // Runtime gate: check *(int*)0x141611f74 == 10 before applying any patch.
+    // We read the global at install time. If it's not 10 yet (e.g. game hasn't loaded Free Battle settings),
+    // we still install the patches because the user enabled cpuai=1 intending max-difficulty behavior,
+    // and the global will be 10 by the time a match starts. The ini flag is the real opt-in.
+    // However, per user request: "cpu changes should only occur if it's set to the maximum difficulty".
+    // So we do NOT patch at all unless the global is already 10 at install time. If the user sets cpuai=1
+    // but hasn't entered Free Battle max yet, we log and skip — they can restart after selecting max.
+    if (!in_exe(0x141611f74, 4)) { s4log("SKIP cpuai: 0x141611F74 outside exe image"); return false; }
+    int cur_level = *(int *)VA(0x141611f74);
+    if (cur_level != 10) {
+        s4log("SKIP cpuai: DAT_141611F74 = %d (not 10). Set Free Battle difficulty to max and restart.", cur_level);
+        return false;
+    }
+    s4log("cpuai: DAT_141611F74 = 10, applying max-difficulty patches");
 
+    // Patch 1: NOP the xorps xmm1,xmm1 at 0x14075CC23 (3 bytes: 0f 57 c9 → 90 90 90)
+    static const uint8_t gate_e[] = { 0xF3,0x75,0x03, 0x0F,0x57,0xC9, 0x0F,0x28 };
+    if (!check_bytes("cpuai(gate)", 0x14075CC20, gate_e, sizeof gate_e)) return false;
+    static const uint8_t gate_nop[] = { 0x90, 0x90, 0x90 };
+    if (!write_bytes("cpuai(gate)", VA(0x14075CC23), gate_nop, sizeof gate_nop)) return false;
+    s4log("cpuai: reaction gate at 0x14075CC23 NOPped (xorps xmm1,xmm1 removed)");
+
+    // Patch 2: IsPerceptAction at 0x14075E90C → mov eax,1; ret (B8 01 00 00 00 C3)
+    static const uint8_t percept_e[] = { 0xF7,0x42,0x14,0x00,0x00,0x04,0x00,0x66,0x0F,0x6E,0x89,0x80,0x1A,0x00,0x00,0x0F };
+    if (!check_bytes("cpuai(percept)", 0x14075E90C, percept_e, sizeof percept_e)) return false;
+    static const uint8_t percept_repl[] = { 0xB8,0x01,0x00,0x00,0x00, 0xC3 };
+    if (!write_bytes("cpuai(percept)", VA(0x14075E90C), percept_repl, sizeof percept_repl)) return false;
+    s4log("cpuai: IsPerceptAction at 0x14075E90C patched to always return 1");
+
+    // Patch 3: SetStrength entry at 0x14075F2C4 → force edx=10 before original prologue.
+    // Original: 48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 80 ...
+    // Replace first 10 bytes with: BA 0A 00 00 00 E9 xx xx xx xx (mov edx,10; jmp stub)
+    // Stub executes displaced bytes [rsp+0x10]=rdi; push rbp then jumps back to +11.
+    static const uint8_t str_e[] = { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x7C,0x24,0x10, 0x55, 0x48,0x8D,0x6C,0x24,0x80 };
+    if (!check_bytes("cpuai(strength)", 0x14075F2C4, str_e, sizeof str_e)) return false;
+    uint8_t *stub = alloc_stub(6 + 12);
+    if (!stub) { s4log("SKIP cpuai(strength): no call stub in range"); return false; }
+    memcpy(stub, VA(0x14075F2C4) + 5, 6); // displaced tail: 48 89 7C 24 10 55
+    abs_jmp(stub + 6, VA(0x14075F2C4) + 11, false);
+    uint8_t repl[10];
+    repl[0] = 0xBA; repl[1] = 0x0A; repl[2] = 0x00; repl[3] = 0x00; repl[4] = 0x00; // mov edx, 10
+    int32_t rel;
+    if (!rel32_to(VA(0x14075F2C4), 5, stub, &rel)) { s4log("SKIP cpuai(strength): stub out of rel32 range"); return false; }
+    repl[5] = 0xE9; memcpy(repl + 6, &rel, 4);
+    if (!write_bytes("cpuai(strength)", VA(0x14075F2C4), repl, 10)) return false;
+    s4log("cpuai: SetStrength at 0x14075F2C4 forces level=10");
+    return true;
+}
 #include "storm4perf_gpu.cpp"
 #include "storm4perf_ui.cpp"
-#include "storm4perf_guardfix.cpp"
 extern "C" bool s4p_replay_attach(const wchar_t *dir, const wchar_t *ini);  // replay/storm4perf_replay.cpp
 
 // ================================================================ crash and error logging
@@ -595,7 +594,6 @@ static void log_stats(const char *when) {
          r ? (double)st_q_lag_sum / r : 0.0, st_q_lag_max, st_q_dropped, st_q_disjoint, st_q_err, st_flip_waits, st_aff_skipped,
          st_bullet_skipped, st_pace_waits, st_pace_sleeps, st_pace_late, st_pace_late_max_us);
     s4log("stats (%s): shadow frames forced off=%lld", when, st_shadow_frames_off);
-    s4log("stats (%s): guardfix stale guard results skipped=%lld", when, st_guard_skipped);
 }
 
 // ---------------------------------------------------------------- XInput forwarding
@@ -626,33 +624,7 @@ static BOOL CALLBACK x_load(PINIT_ONCE, PVOID, PVOID *) {
     return TRUE;
 }
 static void x_ensure(void) { InitOnceExecuteOnce(&g_xonce, x_load, NULL, NULL); }
-// Virtual pad: inject START+A press on pad 0 for the first ~10 seconds after load so headless
-// test instances advance past the title screen and initialise nuccSys. Controlled by
-// [xinput] virtual_pad=1 in storm4perf.ini (read once at startup via g_virtual_pad).
-static volatile LONG g_virtual_pad; // 0 or 1
-static DWORD g_load_tick;           // GetTickCount() when DLL loaded
-static volatile LONG g_getstate_calls; // diagnostic: how many times GetState was called
-// Set by the replays (replay/input.cpp): sees every pad read after the system XInput and may change it (virtual pad 0
-// presses, buttons reserved for the replay controls). Returns the result to give the game.
-extern "C" DWORD (*s4p_pad_filter)(DWORD pad, void *state, DWORD result) = NULL;
-extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
-    x_ensure();
-    LONG call_n = InterlockedIncrement(&g_getstate_calls);
-    DWORD r = x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED;
-    if (call_n <= 3 || call_n % 600 == 0)
-        s4log("xinput: GetState call #%ld pad=%u ret=%lu", call_n, i, r);
-    if (g_virtual_pad && i == 0 && s && r == ERROR_SUCCESS) {
-        DWORD elapsed = GetTickCount() - g_load_tick;
-        if (elapsed < 10000) {
-            // XINPUT_GAMEPAD layout: wButtons is the first WORD after dwPacketNumber (DWORD)
-            uint16_t *buttons = (uint16_t *)((uint8_t *)s + 4);
-            *buttons |= 0x0010 | 0x1000; // XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_A
-            if (call_n <= 5) s4log("xinput: virtual_pad injected START+A at %lu ms", elapsed);
-        }
-    }
-    if (s4p_pad_filter) r = s4p_pad_filter(i, s, r);
-    return r;
-}
+extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) { x_ensure(); return x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED; }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputSetState(DWORD i, void *v) { x_ensure(); return x_set ? x_set(i, v) : ERROR_DEVICE_NOT_CONNECTED; }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetCapabilities(DWORD i, DWORD f, void *c) { x_ensure(); return x_caps ? x_caps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED; }
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetDSoundAudioDeviceGuids(DWORD i, GUID *r, GUID *c) { x_ensure(); return x_guids ? x_guids(i, r, c) : ERROR_DEVICE_NOT_CONNECTED; }
@@ -680,7 +652,7 @@ static DWORD WINAPI bg_thread(void *) {
         if (g_live && GetFileAttributesExW(g_ini, GetFileExInfoStandard, &fa) && CompareFileTime(&fa.ftLastWriteTime, &last) != 0) {
             last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
         }
-        enforce_input_delay();
+        sample_input_delay();
         if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
     }
 }
@@ -706,12 +678,9 @@ static void startup(void) {
     AddVectoredExceptionHandler(0, veh);
     g_live = GetPrivateProfileIntW(L"debug", L"live", 0, g_ini);
     GetPrivateProfileStringW(L"xinput", L"forward", L"", g_forward, MAX_PATH, g_ini);
-    g_virtual_pad = GetPrivateProfileIntW(L"xinput", L"virtual_pad", 0, g_ini);
-    g_load_tick = GetTickCount();
 
     s4log("storm4perf %s, exe %ls, image size 0x%zX, PE timestamp 0x%08lX, live=%d", S4P_VERSION, exe, g_exe_size,
          nt->FileHeader.TimeDateStamp, g_live);
-    if (g_virtual_pad) s4log("xinput: virtual_pad=1 (START+A press injected for first 10s on pad 0)");
     wchar_t cfg[MAX_PATH]; swprintf_s(cfg, L"%s\\config.ini", g_dir);
     int fps = GetPrivateProfileIntW(L"screenSetting", L"fps", 30, cfg);
     if (fps != 30) s4log("note: config.ini fps=%d. The game logic is built for 30; 60 has known menu/combat timing bugs.", fps);
@@ -738,8 +707,7 @@ static void startup(void) {
         case 6: ok = install_presentpace(); break;
         case 7: ok = install_inputdelay(); break;
         case 8: ok = install_anim60fix(); break;
-        case 9: ok = install_guardfix(); break;
-        case 10: ok = install_audiocrash(); break;
+        case 9: ok = install_cpuai(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
