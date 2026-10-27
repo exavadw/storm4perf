@@ -11,9 +11,6 @@
 //   0x14074031C(BattleSelectParam*) copies the battle setup into the duel globals (VSLoading calls it before the loader
 //   requests fighters); playback from a file writes the recorded setup into it first and empties the fighter slots
 //   character select preloaded, so the battle loads the replay's fighters and stage.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include "replay.h"
 
 #ifndef NOMINMAX
