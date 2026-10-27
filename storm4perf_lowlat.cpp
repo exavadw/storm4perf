@@ -18,6 +18,13 @@
 //             a present without vsync would tear about 70% down the screen (it lands latent_offset_us before the
 //             refresh), so there it is presented with vsync: it is already finished, so it waits only that offset.
 //             (Fullscreen is not measured yet.)
+//   early     (1.09) Present each frame from the render thread the moment it has drawn it, instead of at the start of the
+//             next game tick. The engine's order per tick is: pad read, update (records draw commands), Present (of the
+//             previous image), kick of the new commands, render thread draws them; so a drawn frame waited most of a
+//             tick (~33 ms at 30 FPS) in the back buffer for the next tick's Present. The main thread's own Present is skipped when the render thread already presented. Hooked at the
+//             render job's end (0x14018C8E2, shared with flipwait), under the job's lock, so the next kick waits for it.
+//   elatent   early + latent: the frame start is held so the render thread's Present lands latent_offset_us before a
+//             refresh.
 //
 // [lowlat] measure = 1 (test copies only): the module times virtual taps through the whole chain without pressing
 // anything in the game. A tap k happens at a random time t; the first frame whose pad read comes after t is the frame
@@ -37,10 +44,30 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "user32.lib")
 
-enum { LL_OFF = 0, LL_LATENCY1 = 1, LL_LATENT = 2 };
-static const char *const kLlNames[] = { "off", "latency1", "latent" };
+enum { LL_OFF = 0, LL_LATENCY1 = 1, LL_LATENT = 2, LL_EARLY = 3, LL_EARLY_LATENT = 4 };
+static const char *const kLlNames[] = { "off", "latency1", "latent", "early", "elatent" };
+static bool ll_is_latent(LONG m) { return m == LL_LATENT || m == LL_EARLY_LATENT; }
+static bool ll_is_early(LONG m) { return m == LL_EARLY || m == LL_EARLY_LATENT; }
+static int ll_parse_mode(const wchar_t *v) {
+    for (int i = 0; i < 5; i++) { wchar_t w[16]; swprintf_s(w, L"%hs", kLlNames[i]); if (_wcsicmp(v, w) == 0) return i; }
+    return LL_OFF;
+}
 struct LlMode { int mode; int offset_us; };
 static LlMode g_ll_ab[8]; static int g_ll_nab, g_ll_ab_ms;
+
+// Engine points per exe (same engine code in Storm 1 and 4, different addresses):
+//   frame  = where a game tick starts its pad read and update (0: the main thread's first XInputGetState of the tick;
+//            Storm 1 polls XInput only for connected pads, so there the post-frame function nuccSys::Update calls after
+//            its limiter is hooked instead);
+//   kick   = mmDrawCommandManager FrameEnd (hands the tick's draw commands to the render thread);
+//   clear  = render job end: `mov byte [rbx+88h],0` before `call [LeaveCriticalSection]` (at clear + 14).
+struct LlGame { const char *name; DWORD ts, size; uint64_t frame, kick, clear; };
+static const LlGame kLlGames[] = {
+    { "Storm 4 1.09", 0x5EF2F684, 0x8F1D000, 0, 0x14018D740, 0x14018C8D4 },
+    { "Storm 1 (Steam)", 0x58DB8286, 0xC67000, 0x1404A3B30, 0x14010E500, 0x14010D694 },
+};
+static const LlGame *g_ll_game;
+static bool g_ll_frames_from_xinput = true;  // read by storm4perf.cpp's XInputGetState
 static volatile LONG g_ll_mode, g_ll_offset_us = -2000;     // current mode (the A/B thread may change it)
 static int g_ll_measure, g_ll_block, g_ll_fps = 30, g_ll_wait_start;
 static bool g_ll_vsync_on;
@@ -139,7 +166,7 @@ static void ll_on_pad_read(void) {
     bool new_frame = now - g_ll_last_read_us > 4000;  // a frame reads all pads back to back; frames are >= 16 ms apart
     g_ll_last_read_us = now;
     if (!new_frame) return;
-    if (g_ll_mode == LL_LATENT && !g_ll_vsync_on) { ll_latent_wait(); now = qpc_us(); g_ll_last_read_us = now; }
+    if (ll_is_latent(g_ll_mode) && !g_ll_vsync_on) { ll_latent_wait(); now = qpc_us(); g_ll_last_read_us = now; }
     LONG f = g_ll_frame + 1;
     LlFrame &r = g_ll_frames[f % LL_RING];
     r.read_us = now; r.pres0_us = r.pres1_us = 0; r.mode = g_ll_mode; r.offset = g_ll_offset_us;
@@ -210,6 +237,7 @@ static const char *ll_mod_of(const void *a) {  // "module+0xoffset" for logs
 }
 static __declspec(thread) int t_ll_depth;
 // [lowlat] trace=1 (diagnostic): which frame's drawing a Present shows. Events R (main thread pad read = frame start),
+// K (render kick), 
 // B (back buffer bound as a render target: the frame's final pass) and P0/P1 (Present call/return), with time and
 // thread, for 600 events after start-up; then written to the log.
 static int g_ll_trace; static ID3D11Resource *g_ll_bb;
@@ -232,11 +260,24 @@ static volatile LONG g_ll_kick_frame;  // frame (pad read) during which the last
 static void ll_kick(void *mgr) { ll_ev('K'); InterlockedExchange(&g_ll_kick_frame, g_ll_frame); ll_real_kick(mgr); }
 static void ll_hook_kick(void) {
     static const uint8_t e[] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };  // push rbx; sub rsp,20h (checked before hooking)
-    if (!in_exe(0x14018D740, sizeof e) || memcmp(VA(0x14018D740), e, sizeof e) != 0) { s4log("lowlat: trace without K (not 1.09's kick)"); return; }
+    uint64_t k = g_ll_game ? g_ll_game->kick : 0;
+    if (ll_real_kick) return;
+    if (!k || !in_exe(k, sizeof e) || memcmp(VA(k), e, sizeof e) != 0) { s4log("lowlat: no render kick hook (unknown exe)"); return; }
     MH_STATUS r = MH_Initialize();
-    if ((r == MH_OK || r == MH_ERROR_ALREADY_INITIALIZED) && MH_CreateHook(VA(0x14018D740), (void *)ll_kick, (void **)&ll_real_kick) == MH_OK &&
-        MH_EnableHook(VA(0x14018D740)) == MH_OK) s4log("lowlat: trace K hooked");
-    else s4log("lowlat: trace K hook failed");
+    if ((r == MH_OK || r == MH_ERROR_ALREADY_INITIALIZED) && MH_CreateHook(VA(k), (void *)ll_kick, (void **)&ll_real_kick) == MH_OK &&
+        MH_EnableHook(VA(k)) == MH_OK) s4log("lowlat: render kick hooked at 0x%llX", (unsigned long long)k);
+    else s4log("lowlat: render kick hook failed");
+}
+// Storm 1: the tick's post-frame function (pad read, update, draw recording) stands in for the XInput read.
+typedef void (*LlFrameFn)(void *);
+static LlFrameFn ll_real_frame;
+static void ll_frame(void *sys) { ll_on_pad_read(); ll_real_frame(sys); }
+static bool ll_hook_frame(uint64_t a) {
+    static const uint8_t e[] = { 0x48, 0x83, 0xEC, 0x68 };  // sub rsp,68h
+    if (!in_exe(a, sizeof e) || memcmp(VA(a), e, sizeof e) != 0) { s4log("lowlat: frame function bytes differ at 0x%llX", (unsigned long long)a); return false; }
+    MH_STATUS r = MH_Initialize();
+    return (r == MH_OK || r == MH_ERROR_ALREADY_INITIALIZED) && MH_CreateHook(VA(a), (void *)ll_frame, (void **)&ll_real_frame) == MH_OK &&
+           MH_EnableHook(VA(a)) == MH_OK;
 }
 typedef void (STDMETHODCALLTYPE *LlOMSetRTFn)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
 static LlOMSetRTFn ll_real_omset;
@@ -279,7 +320,37 @@ static void ll_save_shot(IDXGISwapChain *sc) {
     }
     bb->Release();
 }
+static HRESULT STDMETHODCALLTYPE ll_present_body(IDXGISwapChain *sc, UINT sync, UINT flags);
+// early present: the render thread presents at its job end; the main thread's next Present is skipped
+static SRWLOCK g_ll_plock = SRWLOCK_INIT;      // one Present at a time between the two threads
+static volatile LONG g_ll_early_pending;      // the render thread presented since the main thread's last Present
+static volatile LONG g_ll_main_sync;          // sync interval the game asks for
+static volatile LONG64 st_ll_early, st_ll_main_skipped, st_ll_main_through;
+static __declspec(thread) int t_ll_early;
+static DWORD g_ll_render_tid;
+static void ll_job_end(void) {
+    g_ll_render_tid = GetCurrentThreadId();
+    if (!ll_is_early(g_ll_mode) || !g_ll_sc) return;
+    AcquireSRWLockExclusive(&g_ll_plock);
+    t_ll_early = 1;
+    g_ll_sc->Present((UINT)g_ll_main_sync, 0);  // through the vtable, so ll_present does the bookkeeping
+    t_ll_early = 0;
+    InterlockedExchange(&g_ll_early_pending, 1); InterlockedIncrement64(&st_ll_early);
+    ReleaseSRWLockExclusive(&g_ll_plock);
+}
 static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    if (!t_ll_early && sc == g_ll_sc && !t_ll_in_present) {
+        InterlockedExchange(&g_ll_main_sync, (LONG)sync);
+        if (ll_is_early(g_ll_mode) && InterlockedExchange(&g_ll_early_pending, 0)) { InterlockedIncrement64(&st_ll_main_skipped); return S_OK; }
+        if (ll_is_early(g_ll_mode)) {  // the render job is late: present the old image as the game would, never at once with it
+            InterlockedIncrement64(&st_ll_main_through);
+            AcquireSRWLockExclusive(&g_ll_plock); HRESULT hr = ll_present_body(sc, sync, flags); ReleaseSRWLockExclusive(&g_ll_plock);
+            return hr;
+        }
+    }
+    return ll_present_body(sc, sync, flags);
+}
+static HRESULT STDMETHODCALLTYPE ll_present_body(IDXGISwapChain *sc, UINT sync, UINT flags) {
     struct Depth { Depth() { t_ll_depth++; } ~Depth() { t_ll_depth--; } } depth_;
     if (t_ll_depth >= 3) {
         static volatile LONG logged;
@@ -314,18 +385,19 @@ static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT 
         if ((bool)fs != fullscreen) { fullscreen = fs != FALSE; s4log("lowlat: swapchain %s", fullscreen ? "fullscreen" : "windowed"); }
         if (g_ll_shot_req[0] && GetFileAttributesW(g_ll_shot_req) != INVALID_FILE_ATTRIBUTES) ll_save_shot(sc);
     }
-    if (g_ll_mode == LL_LATENT && !g_ll_vsync_on && fullscreen && sync == 0) sync = 1;
+    if (ll_is_latent(g_ll_mode) && !g_ll_vsync_on && fullscreen && sync == 0) sync = 1;
     LONG f = g_ll_frame; int64_t t0 = qpc_us();
     LlFrame &r = g_ll_frames[f % LL_RING];
     bool first = f != g_ll_last_presented;
     if (!first) InterlockedIncrement64(&st_ll_dup_present);
     if (first) r.pres0_us = t0;
     if (first && g_ll_measure) {
-        // Which tick's simulation this Present shows (trace=1 on 1.09): each tick reads the pads, Presents, then kicks the
-        // previous tick's draw commands, which the render thread draws into the back buffer at once; the next tick's
-        // Present shows them. So the image is the tick before the last kick. Without the kick hook, the first Present
-        // after the read is used and the absolute numbers miss that 2-tick pipeline (logged at start).
-        LONG shown = ll_real_kick ? g_ll_kick_frame - 1 : f;
+        // Which tick's simulation this Present shows (trace=1 on 1.09): a tick reads the pads, updates and records its
+        // draw commands, Presents, then (WaitVSync, start of the next nuccSys::Update) kicks those commands; the render
+        // thread draws them at once. The game's next Present shows that image, so it is the frame of the last kick; an
+        // early present at the job end shows the same frame. Without the kick hook the first Present after the read is
+        // used, which is one tick too early for the game's own Present.
+        LONG shown = ll_real_kick ? g_ll_kick_frame : f;
         LONG n = g_ll_ntaps, m = g_ll_marked;
         while (m < n && g_ll_taps[m % LL_TAPS].frame && g_ll_taps[m % LL_TAPS].frame <= shown) { g_ll_taps[m % LL_TAPS].show_p0 = t0; m++; }
         if (m != g_ll_marked) g_ll_shown_tap = m - 1;
@@ -465,6 +537,44 @@ static DWORD WINAPI ll_capture_thread(void *) {
     }
 }
 
+// ---------------------------------------------------------------- watchdog: stacks of a stalled game
+// If the main thread stops reading the pads for 3 s while the game runs, log the main and render threads' stacks
+// (module+offset per frame, unwound with the x64 unwind data) once, to see where a hang sits.
+static void ll_log_stack(DWORD tid, const char *who) {
+    if (!tid) return;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) { s4log("watchdog: %s thread %lu: OpenThread failed", who, tid); return; }
+    CONTEXT c = {}; c.ContextFlags = CONTEXT_FULL; char line[1024]; size_t n = 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        if (GetThreadContext(h, &c)) {
+            for (int i = 0; i < 24 && c.Rip; i++) {
+                n += sprintf_s(line + n, sizeof line - n, " %s", ll_mod_of((void *)c.Rip));
+                DWORD64 base = 0; PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+                if (!fe) { c.Rip = *(DWORD64 *)c.Rsp; c.Rsp += 8; continue; }  // leaf function
+                void *hd = NULL; DWORD64 ef = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fe, &c, &hd, &ef, NULL);
+                if (n > sizeof line - 80) break;
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    s4log("watchdog: %s thread %lu stack:%s", who, tid, line);
+}
+static DWORD WINAPI ll_watchdog(void *) {
+    bool logged = false;
+    for (;;) {
+        Sleep(500);
+        int64_t last = g_ll_last_read_us;
+        if (!last || logged) continue;
+        if (qpc_us() - last > 3000000) {
+            logged = true;
+            s4log("watchdog: no pad read for %.1f s (mode %s)", (qpc_us() - last) / 1e6, kLlNames[g_ll_mode]);
+            ll_log_stack(g_ll_main_tid, "main"); ll_log_stack(g_ll_render_tid, "render");
+        }
+    }
+}
+
 // ---------------------------------------------------------------- measurement thread: taps, A/B switching, report
 struct LlAcc { int n; double sum[6]; int64_t mn, mx; };
 static LlAcc g_ll_acc[8]; static int g_ll_cur_ab = -1;
@@ -500,6 +610,7 @@ static void ll_report(const char *when) {
               when, kLlNames[g_ll_ab[i].mode], g_ll_ab[i].offset_us, s.n, s.sum[5] / s.n / 1000, s.mn / 1000.0, s.mx / 1000.0,
               s.sum[0] / s.n / 1000, s.sum[1] / s.n / 1000, s.sum[2] / s.n / 1000, s.sum[3] / s.n / 1000, s.sum[4] / s.n / 1000);
     }
+    if (st_ll_early) s4log("lowlat %s: early presents=%lld, main Presents skipped=%lld, main Presents through (render job late)=%lld", when, st_ll_early, st_ll_main_skipped, st_ll_main_through);
     s4log("lowlat %s: waits=%lld (avg %.2f ms) late=%lld dup_present=%lld no_present=%lld | capture frames=%lld lost=%lld occluded=%lld | refresh %.3f ms, work est %.2f ms",
           when, st_ll_waits, st_ll_waits ? st_ll_wait_us / 1000.0 / st_ll_waits : 0.0, st_ll_late, st_ll_dup_present, st_ll_no_present,
           st_ll_dup_frames, st_ll_dup_lost, st_ll_occluded, g_ll_period_x1000 / 1e6, ll_work_estimate() / 1000.0);
@@ -606,10 +717,10 @@ static DWORD ll_blocked_pad(DWORD i, void *s) {
     memset(s, 0, 16); return ERROR_SUCCESS;  // XINPUT_STATE: packet number + XINPUT_GAMEPAD
 }
 
-static void install_lowlat(void) {
+static void install_lowlat(bool gpu_timer_safe) {
     wchar_t v[256];
     GetPrivateProfileStringW(L"lowlat", L"mode", L"off", v, 256, g_ini);
-    LONG mode = _wcsicmp(v, L"latency1") == 0 ? LL_LATENCY1 : _wcsicmp(v, L"latent") == 0 ? LL_LATENT : LL_OFF;
+    LONG mode = ll_parse_mode(v);
     g_ll_offset_us = (LONG)(int)GetPrivateProfileIntW(L"lowlat", L"latent_offset_us", (UINT)-2000, g_ini);
     g_ll_measure = GetPrivateProfileIntW(L"lowlat", L"measure", 0, g_ini);
     g_ll_block = GetPrivateProfileIntW(L"lowlat", L"block_real_input", 0, g_ini);
@@ -624,7 +735,7 @@ static void install_lowlat(void) {
     GetPrivateProfileStringW(L"lowlat", L"ab", L"", v, 256, g_ini);
     for (wchar_t *ctx = NULL, *tok = wcstok_s(v, L", ", &ctx); tok && g_ll_nab < 8; tok = wcstok_s(NULL, L", ", &ctx)) {
         wchar_t *at = wcschr(tok, L'@'); int off = g_ll_offset_us; if (at) { *at = 0; off = _wtoi(at + 1); }
-        int m = _wcsicmp(tok, L"latency1") == 0 ? LL_LATENCY1 : _wcsicmp(tok, L"latent") == 0 ? LL_LATENT : LL_OFF;
+        int m = ll_parse_mode(tok);
         g_ll_ab[g_ll_nab].mode = m; g_ll_ab[g_ll_nab].offset_us = off; g_ll_nab++;
     }
     if (!g_ll_nab) { g_ll_ab[0].mode = mode; g_ll_ab[0].offset_us = g_ll_offset_us; g_ll_nab = 1; }
@@ -633,14 +744,40 @@ static void install_lowlat(void) {
     g_ll_vsync_on = GetPrivateProfileIntW(L"screenSetting", L"vsync", 0, cfg) != 0;
     g_ll_fps = (int)GetPrivateProfileIntW(L"screenSetting", L"fps", 30, cfg);
     if (g_ll_fps != 30 && g_ll_fps != 60) g_ll_fps = 30;
-    bool uses_latent = false; for (int i = 0; i < g_ll_nab; i++) uses_latent |= g_ll_ab[i].mode == LL_LATENT;
+    {
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_exe + ((IMAGE_DOS_HEADER *)g_exe)->e_lfanew);
+        for (const LlGame &gm : kLlGames) if (gm.ts == nt->FileHeader.TimeDateStamp && gm.size == g_exe_size) g_ll_game = &gm;
+        s4log("lowlat: exe %s", g_ll_game ? g_ll_game->name : "unknown (frames from XInput reads; no kick, no early present)");
+    }
+    bool uses_latent = false, uses_early = false;
+    for (int i = 0; i < g_ll_nab; i++) { uses_latent |= ll_is_latent(g_ll_ab[i].mode); uses_early |= ll_is_early(g_ll_ab[i].mode); }
+    if (uses_early && !gpu_timer_safe) {
+        // with the game's blocking GPU-timer readback (0x14019F400: GetData spin on the render thread), early present hung
+        // the game within seconds in battle (main thread in WaitForEnd, render thread spinning; 2026-10-27)
+        s4log("FAIL lowlat: early present needs [fixes] gputimer=1 (the game's GPU-timer spin hangs with it); early -> off, elatent -> latent");
+        for (int i = 0; i < g_ll_nab; i++) if (ll_is_early(g_ll_ab[i].mode)) g_ll_ab[i].mode = g_ll_ab[i].mode == LL_EARLY ? LL_OFF : LL_LATENT;
+        g_ll_mode = g_ll_ab[0].mode; uses_early = false;
+    }
+    if (uses_early) {
+        if (g_ll_game && install_jobend_redirect(g_ll_game->clear, g_ll_game->clear + 14)) { g_jobend_cb = ll_job_end; s4log("OK   lowlat: early present at the render job end"); }
+        else {
+            s4log("FAIL lowlat: early present needs the render job end site (known exe, site not taken by another mod); early -> off, elatent -> latent");
+            for (int i = 0; i < g_ll_nab; i++) if (ll_is_early(g_ll_ab[i].mode)) g_ll_ab[i].mode = g_ll_ab[i].mode == LL_EARLY ? LL_OFF : LL_LATENT;
+            g_ll_mode = g_ll_ab[0].mode;
+        }
+    }
     if (uses_latent && g_ll_vsync_on) s4log("note lowlat: latent needs in-game vsync=0 (config.ini); it stays off while vsync=1");
     if (g_ll_block) ll_block_keyboard("load");
     bool any = g_ll_measure || g_ll_nab > 1 || g_ll_mode != LL_OFF || g_ll_no_focus || g_ll_trace;
+    if (any && g_ll_game && g_ll_game->frame) {
+        if (ll_hook_frame(g_ll_game->frame)) { g_ll_frames_from_xinput = false; s4log("lowlat: ticks from the post-frame function 0x%llX", (unsigned long long)g_ll_game->frame); }
+        else s4log("FAIL lowlat: post-frame hook; ticks from XInput reads (none without a connected pad)");
+    }
     s4log("%s lowlat: mode %s@%d%s measure=%d block_real_input=%d (vsync=%d fps=%d)", any ? "OK  " : "off ", kLlNames[g_ll_mode],
           g_ll_offset_us, g_ll_nab > 1 ? " (A/B list)" : "", g_ll_measure, g_ll_block, g_ll_vsync_on, g_ll_fps);
     if (!any) return;
     HANDLE t = CreateThread(NULL, 0, ll_thread, NULL, 0, NULL); if (t) CloseHandle(t);
+    if (uses_early) { t = CreateThread(NULL, 0, ll_watchdog, NULL, 0, NULL); if (t) CloseHandle(t); }
 }
 static void lowlat_tick(void) {  // background thread: patch modules loaded after start-up too
     static int n;

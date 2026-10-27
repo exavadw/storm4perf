@@ -278,15 +278,33 @@ static bool install_skinwait(void) {
 // ================================================================ fix 3: WaitVSync -> Flip wait (loop at 0x1409E1C60)
 // Original: `do {} while (!mmDrawCommandManager::Flip(mgr))`; Flip fails while mgr+0x88 is set, which the draw-command
 // thread clears at 0x14018C8D4 just before LeaveCriticalSection at 0x14018C8E2. That call is redirected to
-// leave_and_wake, so the main thread can sleep in WaitOnAddress on the flag instead of spinning.
+// leave_and_wake, so the main thread can sleep in WaitOnAddress on the flag instead of spinning. The same site is the end
+// of each render job (the frame is fully drawn there): storm4perf_lowlat.cpp's early present hooks in through g_jobend_cb.
 typedef char (*FlipFn)(void *);
 typedef void (WINAPI *LeaveCsFn)(LPCRITICAL_SECTION);
-static FlipFn g_flip; static void **g_flip_mgr; static LeaveCsFn *g_leave_slot; static bool g_wake_ok;
+static FlipFn g_flip; static void **g_flip_mgr; static LeaveCsFn *g_leave_slot; static bool g_wake_ok, g_jobend_ok;
+static void (*g_jobend_cb)(void);  // render thread, job done, still holding the job critical section
 static volatile LONG64 st_flip_waits;
 static void leave_and_wake(LPCRITICAL_SECTION cs) {
+    if (g_jobend_cb) g_jobend_cb();
     (*g_leave_slot)(cs);  // through the exe's IAT slot, so other hooks on it still run
-    void *mgr = *g_flip_mgr;
+    void *mgr = g_flip_mgr ? *g_flip_mgr : NULL;
     if (mgr) WakeByAddressAll((uint8_t *)mgr + 0x88);
+}
+// Redirect the render job's LeaveCriticalSection to leave_and_wake, once (flipwait and lowlat share it). The site is the
+// same code in the Storm 1-4 builds of the engine: `mov byte [rbx+88h],0; mov rcx,[rbx+90h]; call [LeaveCriticalSection]`
+// (1.09: clear at 0x14018C8D4, call at 0x14018C8E2; Storm 1 Steam: 0x14010D694 / 0x14010D6A2).
+static bool install_jobend_redirect(uint64_t clear_va, uint64_t call_va) {
+    static bool tried; if (tried) return g_jobend_ok; tried = true;
+    static const uint8_t w[] = { 0xC6,0x83,0x88,0x00,0x00,0x00,0x00,0x48,0x8B,0x8B,0x90,0x00,0x00,0x00,0xFF,0x15 };
+    if (!check_bytes("render job end", clear_va, w, sizeof w) || call_va != clear_va + 14) return false;
+    if (ff15_slot(call_va) != (uint8_t *)find_iat("KERNEL32.dll", "LeaveCriticalSection")) { s4log("SKIP render job end: not a LeaveCriticalSection call"); return false; }
+    uint8_t *site = VA(call_va), *stub = alloc_stub(12); int32_t rel;
+    if (!stub || !rel32_to(site, 5, stub, &rel)) { s4log("SKIP render job end: no call stub in range"); return false; }
+    g_leave_slot = (LeaveCsFn *)ff15_slot(call_va);
+    uint8_t sb[12]; abs_jmp(sb, (void *)leave_and_wake, false); memcpy(stub, sb, sizeof sb);
+    uint8_t b[6] = { 0xE8 }; memcpy(b + 1, &rel, 4); b[5] = 0x90;
+    return g_jobend_ok = write_bytes("render job end", site, b, sizeof b);
 }
 static void wait_flip(void) {
     if (!g_on.flipwait) { while (!g_flip(*g_flip_mgr)) {} return; }
@@ -307,17 +325,9 @@ static bool install_flipwait(void) {
     if (!check_bytes("flipwait", 0x1409E1C60, e, sizeof e) || !check_bytes("flipwait", 0x14018D7E0, flip_e, sizeof flip_e)) return false;
     g_flip = (FlipFn)VA(0x14018D7E0); g_flip_mgr = (void **)VA(0x148D32FD8);
     // wake-up site (optional: without it the wait falls back to pause/yield/sleep)
-    static const uint8_t w[] = { 0xC6,0x83,0x88,0x00,0x00,0x00,0x00,0x48,0x8B,0x8B,0x90,0x00,0x00,0x00,0xFF,0x15,0xB8,0x08,0xD2,0x00 };
-    if (check_bytes("flipwait(wake)", 0x14018C8D4, w, sizeof w)) {
-        uint8_t *site = VA(0x14018C8E2), *stub = alloc_stub(12); int32_t rel;
-        if (stub && rel32_to(site, 5, stub, &rel)) {
-            g_leave_slot = (LeaveCsFn *)ff15_slot(0x14018C8E2);
-            uint8_t sb[12]; abs_jmp(sb, (void *)leave_and_wake, false); memcpy(stub, sb, sizeof sb);
-            uint8_t b[6] = { 0xE8 }; memcpy(b + 1, &rel, 4); b[5] = 0x90;
-            g_wake_ok = write_bytes("flipwait(wake)", site, b, sizeof b);
-            if (g_wake_ok) s4log("flipwait: render thread wakes the main thread (WaitOnAddress)");
-        } else s4log("SKIP flipwait(wake): no call stub in range; using pause/yield/sleep instead");
-    }
+    g_wake_ok = install_jobend_redirect(0x14018C8D4, 0x14018C8E2);
+    if (g_wake_ok) s4log("flipwait: render thread wakes the main thread (WaitOnAddress)");
+    else s4log("flipwait: no wake-up site; using pause/yield/sleep instead");
     uint8_t b[16]; abs_jmp(b, (void *)wait_flip, true); memset(b + 12, 0x90, 4);
     return write_bytes("flipwait", VA(0x1409E1C60), b, sizeof b);
 }
@@ -723,7 +733,7 @@ extern "C" DWORD (*s4p_pad_filter)(DWORD pad, void *state, DWORD result) = NULL;
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
     x_ensure();
     LONG call_n = InterlockedIncrement(&g_getstate_calls);
-    ll_on_pad_read();  // storm4perf_lowlat.cpp: frame timing (and the latent wait) before the read
+    if (g_ll_frames_from_xinput) ll_on_pad_read();  // storm4perf_lowlat.cpp: frame timing (and the latent wait) before the read
     DWORD r = g_ll_block ? ll_blocked_pad(i, s) : x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED;
     if (call_n <= 3 || call_n % 600 == 0)
         s4log("xinput: GetState call #%ld pad=%u ret=%lu", call_n, i, r);
@@ -804,8 +814,13 @@ static void startup(void) {
     if (fps != 30) s4log("note: config.ini fps=%d. The game logic is built for 30; 60 has known menu/combat timing bugs.", fps);
 
     LONG want[NFIX]; read_fix_flags(want);
+    // Every fix below, the replays and the options menu are for Storm 4 1.09 (some hook fixed addresses); on any other exe
+    // (Storm 4 1.07/1.08, Storm 1) only the XInput forwarding and the lowlat module (its own per-exe table) run.
+    bool s4_109 = nt->FileHeader.TimeDateStamp == 0x5EF2F684 && g_exe_size == 0x8F1D000;
+    if (!s4_109) { s4log("not Storm 4 1.09: Storm 4 fixes, replays and the options menu stay off"); for (int i = 0; i < NFIX; i++) want[i] = 0; }
     bool any_aff = false;
     for (int i = 0; i < NFIX; i++) {
+        if (!s4_109) continue;
         if (!want[i] && !g_live) { s4log("off  %s (off in storm4perf.ini, or off by default)", kFixNames[i]); continue; }
         bool ok = false;
         switch (i) {
@@ -834,13 +849,15 @@ static void startup(void) {
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
         if (ok) g_installed_any = 1;
     }
-    install_gpu();
-    install_lowlat();
-    if (GetPrivateProfileIntW(L"replay", L"enabled", 1, g_ini)) {
+    if (s4_109) install_gpu();
+    install_lowlat(!s4_109 || g_hooked[0]);  // early present needs the gputimer fix on 1.09 (Storm 1: s1o's gpu_timer, on by default)
+    if (!s4_109) {}
+    else if (GetPrivateProfileIntW(L"replay", L"enabled", 1, g_ini)) {
         bool rp = s4p_replay_attach(g_dir, g_ini);
         s4log("%s replays (log: StormReplay\\logs\\replay.log)", rp ? "OK  " : "FAIL");
     } else s4log("off  replays ([replay] enabled=0)");
-    if (GetPrivateProfileIntW(L"gpu", L"options_menu", 1, g_ini)) {
+    if (!s4_109) {}
+    else if (GetPrivateProfileIntW(L"gpu", L"options_menu", 1, g_ini)) {
         bool ui = install_ui();
         s4log("%s options menu (Shadow Quality: OFF / VERY LOW / LOW / MEDIUM / HIGH)", ui ? "OK  " : "FAIL");
     } else s4log("off  options menu ([gpu] options_menu=0)");
