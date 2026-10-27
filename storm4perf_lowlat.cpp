@@ -14,11 +14,16 @@
 //             finishes latent_offset_us before that refresh: the frame start is held back inside the first pad read of
 //             the frame (XInputGetState after the limiter), so the read is also as fresh as possible. Frames stay on an
 //             exact 2-refresh cadence at 30 FPS. Same idea as Special K's Latent Sync and Slippi's visual-buffer codes.
+//             Windowed, Present goes out without vsync (DWM composites it at the refresh, so nothing tears). Fullscreen,
+//             a present without vsync would tear about 70% down the screen (it lands latent_offset_us before the
+//             refresh), so there it is presented with vsync: it is already finished, so it waits only that offset.
+//             (Fullscreen is not measured yet.)
 //
 // [lowlat] measure = 1 (test copies only): the module times virtual taps through the whole chain without pressing
 // anything in the game. A tap k happens at a random time t; the first frame whose pad read comes after t is the frame
 // that would show it. That frame's Present paints a 16x16 marker in the top-left corner (white/black flips once per
-// tap), and a Desktop Duplication thread timestamps the first desktop image that shows the flip (DXGI LastPresentTime:
+// tap; on 1.09 the frame whose simulation is in the image, see ll_present), and a Desktop Duplication thread
+// timestamps the first desktop image that shows the flip (DXGI LastPresentTime:
 // when DWM took the update, measured ~2 ms after Present at any refresh phase, so not the scanout). The image goes out
 // at the next refresh after that (from the WaitForVBlank clock). Per tap: tap->read, read->Present call, Present
 // call->return, return->DWM, DWM->refresh, and the total to the start of scanout. Rows go to lowlat.csv next to the
@@ -37,7 +42,7 @@ static const char *const kLlNames[] = { "off", "latency1", "latent" };
 struct LlMode { int mode; int offset_us; };
 static LlMode g_ll_ab[8]; static int g_ll_nab, g_ll_ab_ms;
 static volatile LONG g_ll_mode, g_ll_offset_us = -2000;     // current mode (the A/B thread may change it)
-static int g_ll_measure, g_ll_block, g_ll_fps = 30;
+static int g_ll_measure, g_ll_block, g_ll_fps = 30, g_ll_wait_start;
 static bool g_ll_vsync_on;
 
 // ---------------------------------------------------------------- refresh clock (IDXGIOutput::WaitForVBlank thread)
@@ -69,9 +74,13 @@ static int64_t ll_period_us(void) { return g_ll_period_x1000 / 1000; }
 struct LlFrame { int64_t read_us, pres0_us, pres1_us; LONG mode; LONG offset; };
 static LlFrame g_ll_frames[LL_RING];
 static volatile LONG g_ll_frame;             // last frame whose pad read happened
+static void ll_ev(char k);                   // trace event (trace=1)
 static DWORD g_ll_main_tid; static int64_t g_ll_last_read_us;
 static volatile LONG64 st_ll_waits, st_ll_wait_us, st_ll_late, st_ll_dup_present, st_ll_no_present;
 static int64_t g_ll_work_us[32]; static int g_ll_work_i;  // read -> Present return of recent frames
+// per A/B entry, every frame (no display capture needed): read -> Present return in 0.25 ms bins, latent misses
+struct LlFrameStats { LONG64 n, late, sum_us, max_us; LONG bins[200]; };
+static LlFrameStats g_ll_fs[8]; static volatile LONG g_ll_cur_ab_fs;
 static int64_t g_ll_target_us;                // latent: time the current frame's Present should be done by
 static IDXGISwapChain *g_ll_sc; static HWND g_ll_hwnd; static UINT g_ll_bw = 960, g_ll_bh = 540;
 
@@ -97,7 +106,7 @@ static void ll_latent_wait(void) {
     int64_t step = per * (60 / g_ll_fps), work = ll_work_estimate(), now = qpc_us(), off = g_ll_offset_us;
     int64_t target = g_ll_target_us ? g_ll_target_us + step : 0;
     if (!target || now + work > target) {     // first frame or late: the earliest refresh this frame can still make
-        if (target) InterlockedIncrement64(&st_ll_late);
+        if (target) { InterlockedIncrement64(&st_ll_late); g_ll_fs[g_ll_cur_ab_fs & 7].late++; }
         int64_t k = (now + work - off - v + per - 1) / per;
         target = v + k * per + off;
     }
@@ -108,7 +117,7 @@ static void ll_latent_wait(void) {
 }
 
 // ---------------------------------------------------------------- virtual taps (measure=1)
-struct LlTap { int64_t t_us; LONG frame; LONG mode, offset; };
+struct LlTap { int64_t t_us; LONG frame; LONG mode, offset; int64_t show_p0, show_p1; };  // show_*: the Present that shows it
 #define LL_TAPS 4096
 static LlTap g_ll_taps[LL_TAPS];
 static volatile LONG g_ll_ntaps;              // taps issued
@@ -137,6 +146,7 @@ static void ll_on_pad_read(void) {
     if (g_ll_sc && !g_ll_frames[(f - 1) % LL_RING].pres0_us) InterlockedIncrement64(&st_ll_no_present);
     ll_assign_tap(f, now);
     InterlockedExchange(&g_ll_frame, f);
+    ll_ev('R');
 }
 
 // ---------------------------------------------------------------- Present hook (render thread)
@@ -146,6 +156,7 @@ static ID3D11Device *g_ll_dev; static ID3D11DeviceContext *g_ll_ctx; static ID3D
 static volatile LONG g_ll_latency_set = -1;   // frame latency applied to the game device
 static __declspec(thread) int t_ll_in_present;
 static LONG g_ll_last_presented = 0;
+static LONG g_ll_shown_tap = -1;  // tap whose image the current Present carries (render thread only)
 
 // [lowlat] no_focus=1 (test copies without the StormStory runtime): the game pauses when it loses focus, and a test copy
 // must never keep focus. At the first Present the window is subclassed (deactivation dropped, WS_EX_NOACTIVATE), and
@@ -198,6 +209,76 @@ static const char *ll_mod_of(const void *a) {  // "module+0xoffset" for logs
     return b[i];
 }
 static __declspec(thread) int t_ll_depth;
+// [lowlat] trace=1 (diagnostic): which frame's drawing a Present shows. Events R (main thread pad read = frame start),
+// B (back buffer bound as a render target: the frame's final pass) and P0/P1 (Present call/return), with time and
+// thread, for 600 events after start-up; then written to the log.
+static int g_ll_trace; static ID3D11Resource *g_ll_bb;
+struct LlEv { int64_t t; char k; DWORD tid; LONG f; };
+static LlEv g_ll_ev[600]; static volatile LONG g_ll_nev;
+static void ll_ev(char k) {
+    if (!g_ll_trace || !g_ll_sc) return;
+    LONG i = InterlockedIncrement(&g_ll_nev) - 1;
+    if (i < 600) { g_ll_ev[i].t = qpc_us(); g_ll_ev[i].k = k; g_ll_ev[i].tid = GetCurrentThreadId(); g_ll_ev[i].f = g_ll_frame; }
+    if (i == 600) {
+        for (int j = 0; j < 600; j++) s4log("trace %c f=%ld t=%lld tid=%lu", g_ll_ev[j].k, g_ll_ev[j].f, g_ll_ev[j].t - g_ll_ev[0].t, g_ll_ev[j].tid);
+        s4log("trace done");
+    }
+}
+// 1.09 only: the engine's render kick (mmDrawCommandManager FrameEnd 0x14018D740, called by WaitVSync at the start of
+// nuccSys::Update with the previous tick's draw commands) as event K.
+typedef void (*LlKickFn)(void *);
+static LlKickFn ll_real_kick;
+static volatile LONG g_ll_kick_frame;  // frame (pad read) during which the last kick ran
+static void ll_kick(void *mgr) { ll_ev('K'); InterlockedExchange(&g_ll_kick_frame, g_ll_frame); ll_real_kick(mgr); }
+static void ll_hook_kick(void) {
+    static const uint8_t e[] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };  // push rbx; sub rsp,20h (checked before hooking)
+    if (!in_exe(0x14018D740, sizeof e) || memcmp(VA(0x14018D740), e, sizeof e) != 0) { s4log("lowlat: trace without K (not 1.09's kick)"); return; }
+    MH_STATUS r = MH_Initialize();
+    if ((r == MH_OK || r == MH_ERROR_ALREADY_INITIALIZED) && MH_CreateHook(VA(0x14018D740), (void *)ll_kick, (void **)&ll_real_kick) == MH_OK &&
+        MH_EnableHook(VA(0x14018D740)) == MH_OK) s4log("lowlat: trace K hooked");
+    else s4log("lowlat: trace K hook failed");
+}
+typedef void (STDMETHODCALLTYPE *LlOMSetRTFn)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
+static LlOMSetRTFn ll_real_omset;
+static void STDMETHODCALLTYPE ll_omset(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv) {
+    if (g_ll_bb && n && rtv && rtv[0]) {
+        ID3D11Resource *r = NULL; rtv[0]->GetResource(&r);
+        if (r) { if (r == g_ll_bb) ll_ev('B'); r->Release(); }
+    }
+    ll_real_omset(c, n, rtv, dsv);
+}
+// Test copies: llshot.req next to the exe (holding an output .bmp path) dumps the back buffer, before the marker is drawn.
+static wchar_t g_ll_shot_req[MAX_PATH];
+static void ll_save_shot(IDXGISwapChain *sc) {
+    char path[MAX_PATH] = ""; FILE *rf = NULL;
+    if (_wfopen_s(&rf, g_ll_shot_req, L"r") == 0 && rf) { if (fgets(path, MAX_PATH, rf)) path[strcspn(path, "\r\n")] = 0; fclose(rf); }
+    DeleteFileW(g_ll_shot_req);
+    ID3D11Texture2D *bb = NULL, *st = NULL;
+    if (!path[0] || FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb)) || !bb) return;
+    D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0; sd.MipLevels = 1; sd.ArraySize = 1;
+    if (d.SampleDesc.Count == 1 && SUCCEEDED(g_ll_dev->CreateTexture2D(&sd, NULL, &st))) {
+        g_ll_ctx->CopyResource(st, bb);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_ll_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+            int w = d.Width, h = d.Height, stride = (w * 3 + 3) & ~3; BYTE *px = (BYTE *)malloc((size_t)stride * h);
+            bool bgr = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            for (int y = 0; px && y < h; y++) {
+                BYTE *src = (BYTE *)m.pData + (size_t)y * m.RowPitch, *dst = px + (size_t)(h - 1 - y) * stride;
+                for (int x = 0; x < w; x++) { BYTE r = src[x*4], g = src[x*4+1], b = src[x*4+2]; if (bgr) { BYTE t = r; r = b; b = t; } dst[x*3] = b; dst[x*3+1] = g; dst[x*3+2] = r; }
+            }
+            g_ll_ctx->Unmap(st, 0);
+            BITMAPINFOHEADER bi = { sizeof bi, w, h, 1, 24, BI_RGB }; DWORD sz = stride * h;
+            BITMAPFILEHEADER bf = { 0x4D42, (DWORD)(sizeof bf + sizeof bi + sz), 0, 0, sizeof bf + sizeof bi };
+            FILE *f = NULL;
+            if (px && fopen_s(&f, path, "wb") == 0 && f) { fwrite(&bf, sizeof bf, 1, f); fwrite(&bi, sizeof bi, 1, f); fwrite(px, sz, 1, f); fclose(f); }
+            free(px);
+        }
+        st->Release();
+    }
+    bb->Release();
+}
 static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     struct Depth { Depth() { t_ll_depth++; } ~Depth() { t_ll_depth--; } } depth_;
     if (t_ll_depth >= 3) {
@@ -215,17 +296,39 @@ static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT 
             if (g_ll_measure) ll_make_markers(sc);
         }
         g_ll_sc = sc; g_ll_hwnd = sd.OutputWindow;
+        if (g_ll_trace && g_ll_ctx) {
+            sc->GetBuffer(0, __uuidof(ID3D11Resource), (void **)&g_ll_bb); if (g_ll_bb) g_ll_bb->Release();  // the swapchain keeps it alive
+            void **vt = *(void ***)g_ll_ctx; DWORD old;
+            if (VirtualProtect(&vt[33], sizeof(void *), PAGE_EXECUTE_READWRITE, &old)) {
+                ll_real_omset = (LlOMSetRTFn)vt[33]; vt[33] = (void *)ll_omset; VirtualProtect(&vt[33], sizeof(void *), old, &old);
+                s4log("lowlat: trace on (OMSetRenderTargets hooked, back buffer %p)", (void *)g_ll_bb);
+            }
+        }
+        if ((g_ll_trace || g_ll_measure) && g_ll_ctx) ll_hook_kick();
         if (g_ll_no_focus) ll_take_window(g_ll_hwnd);
     }
     ll_apply_latency();
+    static int poll_n; static bool fullscreen;
+    if (poll_n++ % 15 == 0) {
+        BOOL fs = FALSE; sc->GetFullscreenState(&fs, NULL);
+        if ((bool)fs != fullscreen) { fullscreen = fs != FALSE; s4log("lowlat: swapchain %s", fullscreen ? "fullscreen" : "windowed"); }
+        if (g_ll_shot_req[0] && GetFileAttributesW(g_ll_shot_req) != INVALID_FILE_ATTRIBUTES) ll_save_shot(sc);
+    }
+    if (g_ll_mode == LL_LATENT && !g_ll_vsync_on && fullscreen && sync == 0) sync = 1;
     LONG f = g_ll_frame; int64_t t0 = qpc_us();
     LlFrame &r = g_ll_frames[f % LL_RING];
     bool first = f != g_ll_last_presented;
     if (!first) InterlockedIncrement64(&st_ll_dup_present);
     if (first) r.pres0_us = t0;
-    if (first && g_ll_measure) {  // taps whose frame is f or earlier are on screen from this frame on
+    if (first && g_ll_measure) {
+        // Which tick's simulation this Present shows (trace=1 on 1.09): each tick reads the pads, Presents, then kicks the
+        // previous tick's draw commands, which the render thread draws into the back buffer at once; the next tick's
+        // Present shows them. So the image is the tick before the last kick. Without the kick hook, the first Present
+        // after the read is used and the absolute numbers miss that 2-tick pipeline (logged at start).
+        LONG shown = ll_real_kick ? g_ll_kick_frame - 1 : f;
         LONG n = g_ll_ntaps, m = g_ll_marked;
-        while (m < n && g_ll_taps[m % LL_TAPS].frame && g_ll_taps[m % LL_TAPS].frame <= f) m++;
+        while (m < n && g_ll_taps[m % LL_TAPS].frame && g_ll_taps[m % LL_TAPS].frame <= shown) { g_ll_taps[m % LL_TAPS].show_p0 = t0; m++; }
+        if (m != g_ll_marked) g_ll_shown_tap = m - 1;
         g_ll_marked = m;
     }
     if (g_ll_measure && g_ll_mark[0]) {
@@ -234,10 +337,15 @@ static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT 
             g_ll_ctx->CopySubresourceRegion(bb, 0, 0, 0, 0, g_ll_mark[g_ll_marked & 1], 0, NULL); bb->Release();
         }
     }
+    ll_ev('P');
     HRESULT hr = ll_real_present(sc, sync, flags);
+    ll_ev('p');
+    if (g_ll_shown_tap >= 0) { g_ll_taps[g_ll_shown_tap % LL_TAPS].show_p1 = qpc_us(); g_ll_shown_tap = -1; }
     if (first) {
         int64_t t1 = qpc_us(); r.pres1_us = t1; g_ll_last_presented = f;
-        g_ll_work_us[g_ll_work_i++ & 31] = t1 - r.read_us;
+        int64_t w = t1 - r.read_us; g_ll_work_us[g_ll_work_i++ & 31] = w;
+        LlFrameStats &fs = g_ll_fs[g_ll_cur_ab_fs & 7]; fs.n++; fs.sum_us += w; if (w > fs.max_us) fs.max_us = w;
+        fs.bins[w < 0 ? 0 : w / 250 < 199 ? w / 250 : 199]++;
     }
     t_ll_in_present = 0;
     return hr;
@@ -363,9 +471,11 @@ static LlAcc g_ll_acc[8]; static int g_ll_cur_ab = -1;
 static void ll_write_tap(LONG k, int64_t shown_us) {
     LlTap &t = g_ll_taps[k % LL_TAPS]; LlFrame &r = g_ll_frames[t.frame % LL_RING];
     if (!r.pres1_us || r.read_us < t.t_us) return;  // ring entry overwritten or inconsistent
+    // with the kick hook, r is the tap's frame; its image goes out at a later Present: that is in read->Present here
     int64_t v = g_ll_vblank_us, per = ll_period_us(), scan = shown_us;
-    if (v && per > 4000) { int64_t d = shown_us - v; int64_t k = d >= 0 ? d / per + 1 : -((-d) / per); scan = v + k * per; }
-    int64_t c[6] = { r.read_us - t.t_us, r.pres0_us - r.read_us, r.pres1_us - r.pres0_us, shown_us - r.pres1_us, scan - shown_us, scan - t.t_us };
+    if (v && per > 4000) { int64_t d = shown_us - v; int64_t n = d >= 0 ? d / per + 1 : -((-d) / per); scan = v + n * per; }
+    int64_t p0 = t.show_p0 ? t.show_p0 : r.pres0_us, p1 = t.show_p1 ? t.show_p1 : r.pres1_us;  // the Present that carried the image
+    int64_t c[6] = { r.read_us - t.t_us, p0 - r.read_us, p1 - p0, shown_us - p1, scan - shown_us, scan - t.t_us };
     if (c[3] < 0 || c[5] > 500000) return;
     char name[32]; sprintf_s(name, "%s@%ld", kLlNames[t.mode], t.offset);
     if (g_ll_csv) { fprintf(g_ll_csv, "%ld,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", k, name, c[0] / 1000.0, c[1] / 1000.0, c[2] / 1000.0, c[3] / 1000.0, c[4] / 1000.0, c[5] / 1000.0); fflush(g_ll_csv); }
@@ -373,7 +483,17 @@ static void ll_write_tap(LONG k, int64_t shown_us) {
     LlAcc &s = g_ll_acc[a]; if (!s.n) { s.mn = c[5]; s.mx = c[5]; }
     s.n++; for (int i = 0; i < 6; i++) s.sum[i] += c[i]; if (c[5] < s.mn) s.mn = c[5]; if (c[5] > s.mx) s.mx = c[5];
 }
+static double ll_fs_pct(const LlFrameStats &fs, double q) {
+    LONG64 want = (LONG64)(fs.n * q), c = 0; for (int i = 0; i < 200; i++) { c += fs.bins[i]; if (c > want) return (i + 1) * 0.25; }
+    return 50.0;
+}
 static void ll_report(const char *when) {
+    for (int i = 0; i < g_ll_nab; i++) {
+        const LlFrameStats &fs = g_ll_fs[i]; if (!fs.n) continue;
+        s4log("lowlat %s frames: %s@%d n=%lld read->Present avg %.2f p50 %.2f p95 %.2f p99 %.2f max %.2f ms, missed refresh %lld (%.2f%%)",
+              when, kLlNames[g_ll_ab[i].mode], g_ll_ab[i].offset_us, fs.n, fs.sum_us / 1000.0 / fs.n, ll_fs_pct(fs, .5), ll_fs_pct(fs, .95),
+              ll_fs_pct(fs, .99), fs.max_us / 1000.0, fs.late, 100.0 * fs.late / fs.n);
+    }
     for (int i = 0; i < g_ll_nab; i++) {
         LlAcc &s = g_ll_acc[i]; if (!s.n) continue;
         s4log("lowlat %s: %s@%d n=%d tap->scanout avg %.1f ms (min %.1f max %.1f) = tap->read %.1f + read->Present %.1f + in Present %.1f + Present->DWM %.1f + DWM->refresh %.1f",
@@ -398,6 +518,7 @@ static void ll_raise_window(const char *why) {
 }
 static void ll_set_ab(int i) {
     g_ll_cur_ab = i; InterlockedExchange(&g_ll_offset_us, g_ll_ab[i].offset_us); InterlockedExchange(&g_ll_mode, g_ll_ab[i].mode);
+    InterlockedExchange(&g_ll_cur_ab_fs, i);
     g_ll_target_us = 0;
     s4log("lowlat: mode %s@%d", kLlNames[g_ll_ab[i].mode], g_ll_ab[i].offset_us);
 }
@@ -412,9 +533,18 @@ static DWORD WINAPI ll_thread(void *) {
     if (!g_ll_measure) return 0;
     wchar_t p[MAX_PATH]; swprintf_s(p, L"%s\\lowlat.csv", g_dir);
     if (_wfopen_s(&g_ll_csv, p, L"w") == 0 && g_ll_csv) fprintf(g_ll_csv, "tap,mode,tap_to_read_ms,read_to_present_ms,in_present_ms,present_to_dwm_ms,dwm_to_refresh_ms,total_ms\n");
+    // a display that went to sleep composes no desktop frames at all; keep it on while measuring (as a video player does)
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
     ll_raise_window("start");
     t = CreateThread(NULL, 0, ll_capture_thread, NULL, 0, NULL); if (t) CloseHandle(t);
     Sleep(2000);
+    if (g_ll_wait_start) {  // test copies: start the taps only once the scene to measure is up (llstart.req appears)
+        wchar_t go[MAX_PATH]; swprintf_s(go, L"%s\\llstart.req", g_dir);
+        s4log("lowlat: waiting for llstart.req");
+        while (GetFileAttributesW(go) == INVALID_FILE_ATTRIBUTES) Sleep(200);
+        DeleteFileW(go); s4log("lowlat: llstart.req seen, measuring");
+        memset(g_ll_fs, 0, sizeof g_ll_fs);  // frame stats cover the measured scene only
+    }
     srand(GetTickCount());
     int64_t seg_end = 0, last_report = qpc_us(); LONG64 occ_seen = 0;
     if (g_ll_nab) ll_set_ab(0);
@@ -429,7 +559,7 @@ static DWORD WINAPI ll_thread(void *) {
         ll_sleep_until(qpc_us() + 400000 + rand() % 66667);
         LONG k = g_ll_ntaps;
         if (k > 0 && g_ll_marked < k) { Sleep(50); continue; }  // previous tap not presented yet
-        LlTap &tp = g_ll_taps[k % LL_TAPS]; tp.frame = 0; tp.mode = g_ll_mode; tp.offset = g_ll_offset_us;
+        LlTap &tp = g_ll_taps[k % LL_TAPS]; tp.frame = 0; tp.mode = g_ll_mode; tp.offset = g_ll_offset_us; tp.show_p0 = tp.show_p1 = 0;
         tp.t_us = qpc_us();
         InterlockedExchange(&g_ll_ntaps, k + 1);  // the next pad read takes it (ll_assign_tap)
         if (now - last_report > 30000000) { last_report = now; ll_report("30 s"); }
@@ -484,6 +614,9 @@ static void install_lowlat(void) {
     g_ll_measure = GetPrivateProfileIntW(L"lowlat", L"measure", 0, g_ini);
     g_ll_block = GetPrivateProfileIntW(L"lowlat", L"block_real_input", 0, g_ini);
     g_ll_no_focus = GetPrivateProfileIntW(L"lowlat", L"no_focus", 0, g_ini);
+    g_ll_wait_start = GetPrivateProfileIntW(L"lowlat", L"wait_start", 0, g_ini);
+    g_ll_trace = GetPrivateProfileIntW(L"lowlat", L"trace", 0, g_ini);
+    if (g_ll_measure) swprintf_s(g_ll_shot_req, L"%s\\llshot.req", g_dir);
     if (g_ll_no_focus) { HWND fg = GetForegroundWindow(); DWORD fp = 0; GetWindowThreadProcessId(fg, &fp); g_ll_launch_fg = fp != GetCurrentProcessId() ? fg : NULL; }
     g_ll_ab_ms = GetPrivateProfileIntW(L"lowlat", L"ab_seconds", 20, g_ini) * 1000;
     g_ll_win_x = (int)GetPrivateProfileIntW(L"lowlat", L"window_x", (UINT)-1, g_ini);
@@ -503,7 +636,7 @@ static void install_lowlat(void) {
     bool uses_latent = false; for (int i = 0; i < g_ll_nab; i++) uses_latent |= g_ll_ab[i].mode == LL_LATENT;
     if (uses_latent && g_ll_vsync_on) s4log("note lowlat: latent needs in-game vsync=0 (config.ini); it stays off while vsync=1");
     if (g_ll_block) ll_block_keyboard("load");
-    bool any = g_ll_measure || g_ll_nab > 1 || g_ll_mode != LL_OFF || g_ll_no_focus;
+    bool any = g_ll_measure || g_ll_nab > 1 || g_ll_mode != LL_OFF || g_ll_no_focus || g_ll_trace;
     s4log("%s lowlat: mode %s@%d%s measure=%d block_real_input=%d (vsync=%d fps=%d)", any ? "OK  " : "off ", kLlNames[g_ll_mode],
           g_ll_offset_us, g_ll_nab > 1 ? " (A/B list)" : "", g_ll_measure, g_ll_block, g_ll_vsync_on, g_ll_fps);
     if (!any) return;
