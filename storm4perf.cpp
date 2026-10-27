@@ -677,7 +677,7 @@ static void log_stats(const char *when) {
          r ? (double)st_q_lag_sum / r : 0.0, st_q_lag_max, st_q_dropped, st_q_disjoint, st_q_err, st_flip_waits, st_aff_skipped,
          st_bullet_skipped, st_pace_waits, st_pace_sleeps, st_pace_late, st_pace_late_max_us);
     s4log("stats (%s): shadow frames forced off=%lld", when, st_shadow_frames_off);
-    s4log("stats (%s): guardfix stale guard results skipped=%lld", when, st_guard_skipped);
+    s4log("stats (%s): guardfix stale guard results skipped=%lld; fps60 menu repeated pulses dropped=%lld, late pulses delivered=%lld, bounces dropped=%lld, spring solves rescaled=%lld", when, st_guard_skipped, st_menu_dup, st_menu_late, st_menu_bounce, st_spring_calls);
 }
 
 // ---------------------------------------------------------------- XInput forwarding
