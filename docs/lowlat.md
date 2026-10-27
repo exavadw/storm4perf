@@ -103,8 +103,17 @@ Storm 1's code is known to multiply by such a counter), so `elatent` ships as an
 
 The engine code is the same in Storm 1 (Steam, PE timestamp `0x58DB8286`): post-frame function `0x1404A3B30` (Storm 1
 polls XInput only for connected pads, so ticks come from there), kick `0x14010E500`, job end `0x14010D694` / call
-`0x14010D6A2`. The module carries this table; with the s1o client, set its `[perf] flip_wait=0` so the job-end site is
-free. Not measured yet.
+`0x14010D6A2`, draw manager `0x140B8E598`. With the s1o client, set its `[perf] flip_wait=0` so the job-end site is free.
+
+Measured 2026-10-27 in two offline s1o bot battles (30 FPS, windowed, about 3,600 frames per mode):
+
+- Same order per tick as Storm 4 (trace, medians): pad read, game Present +0.15 ms (previous image), kick +0.28 ms,
+  render thread draws at once, next Present at +33.5 ms.
+- `early`: 2,722 of 2,723 frames presented by the render thread (one late job); read to the image's Present 4.0 ms
+  (p99 6.8) instead of about 33.7 ms (the next tick's Present): about 30 ms less, the same as Storm 4.
+- `elatent` missed its refresh on 1.6-1.8% of frames.
+- The on-screen measurement was blocked (Windows Task View covered the window for both runs), so the Storm 1 figure
+  comes from the in-game timing, not from screen capture. Replays and s1o rollback were not checked with `early`.
 
 ## Test-only settings
 
