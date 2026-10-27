@@ -51,13 +51,13 @@ static void hex(char *out, size_t cap, const uint8_t *p, size_t n) {
 }
 
 // ---------------------------------------------------------------- config
-struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash; };
-enum { NFIX = 11 };
+struct Flags { volatile LONG gputimer, skinwait, flipwait, timeraffinity, vsyncsleep, bulletunpin, presentpace, inputdelay, anim60fix, guardfix, audiocrash, qpctimer; };
+enum { NFIX = 12 };
 static Flags g_on;                   // what the hooks do right now
 static int g_live, g_installed_any;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_forward[MAX_PATH];
-static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash" };
-static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash: game-bug fixes verified in game (see storm4perf.ini)
+static const char *const kFixNames[NFIX] = { "gputimer", "skinwait", "flipwait", "timeraffinity", "vsyncsleep", "bulletunpin", "presentpace", "inputdelay", "anim60fix", "guardfix", "audiocrash", "qpctimer" };
+static const int kFixDefaults[NFIX] = { 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1 };  // bulletunpin: no measurable effect; presentpace: see storm4perf.ini; inputdelay: diagnostic only; anim60fix: measured inert in battle, opt-in; guardfix/audiocrash/qpctimer: game-bug fixes verified in game (see storm4perf.ini)
 static volatile LONG *flag_ptr(int i) { return &g_on.gputimer + i; }
 
 static volatile LONG g_pace_margin_us, g_pace_boost;
@@ -500,6 +500,86 @@ static bool install_audiocrash(void) {
     return true;
 }
 
+// ================================================================ fix 11: qpctimer — a game clock that cannot freeze
+// mmTimer::GetMicroSecond (0x14017E180), GetMilliSecond (0x14017E050) and two inlined copies (present pacing loop
+// 0x14019D900, timer object ctor 0x1401B6830) are the old OGRE Win32 timer: pin to one CPU, read QPC, compare with
+// GetTickCount and correct jumps of more than 100 ms. The correction zero-extends the signed 32-bit offset
+// (mov ecx,edx at 0x14017E225), so when QPC trails GetTickCount by more than 100 ms (the thread was delayed between
+// the two reads) the "adjustment" becomes the time since the previous read: the clock returns its previous value, the
+// gap only grows, and it stays stuck for the rest of the session (the reset runs only at start-up). Waits on it (VSync
+// callback thread 0x1409E05C0, present pacing) then never end. storm4-performance.md section 1.7.
+// This returns plain QPC time from the game's own base and frequency: no CPU pin, no GetTickCount check, and no shared
+// state written, so it is also safe when several threads read the clock at once.
+static volatile int32_t *g_tm_ok; static volatile int64_t *g_tm_base, *g_tm_freq; static volatile uint32_t *g_tm_tick0;
+static uint64_t qt_elapsed(uint64_t mul) {  // (QPC - base) * mul / freq without overflow
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    uint64_t d = (uint64_t)(t.QuadPart - *g_tm_base), f = (uint64_t)*g_tm_freq;
+    return d / f * mul + d % f * mul / f;
+}
+static uint64_t qt_us(void) { return *g_tm_ok ? qt_elapsed(1000000) : (uint32_t)((GetTickCount() - *g_tm_tick0) * 1000u); }
+static uint64_t qt_ms(void) { return *g_tm_ok ? (uint32_t)qt_elapsed(1000) : (uint32_t)(GetTickCount() - *g_tm_tick0); }
+
+static uint8_t *emit(uint8_t *p, const void *b, size_t n) { memcpy(p, b, n); return p + n; }
+static uint8_t *emit_mov(uint8_t *p, uint8_t reg, const void *imm) {  // mov rax/rcx, imm64
+    p[0] = 0x48; p[1] = (uint8_t)(0xB8 + reg); memcpy(p + 2, &imm, 8); return p + 10;
+}
+// mov rax, &g_on.qpctimer ; cmp dword [rax], 0 ; je +off  (off = bytes of the "on" path that follow)
+static uint8_t *emit_flag_test(uint8_t *p, uint8_t off) {
+    p = emit_mov(p, 0, (const void *)&g_on.qpctimer);
+    const uint8_t t[] = { 0x83, 0x38, 0x00, 0x74, off }; return emit(p, t, sizeof t);
+}
+static bool jmp_to_stub(const char *what, uint64_t va, size_t len, uint8_t *stub) {
+    uint8_t b[16]; int32_t rel;
+    if (!rel32_to(VA(va), 5, stub, &rel)) { s4log("SKIP qpctimer %s: no stub in range", what); return false; }
+    b[0] = 0xE9; memcpy(b + 1, &rel, 4); memset(b + 5, 0x90, len - 5);
+    return write_bytes("qpctimer", VA(va), b, len);
+}
+static bool qt_hook_entry(const char *what, uint64_t va, const void *fn) {  // mmTimer::Get*Second entry
+    static const uint8_t prologue[] = { 0x40,0x53, 0x55, 0x48,0x83,0xEC,0x28 };  // push rbx ; push rbp ; sub rsp, 28h
+    if (!check_bytes("qpctimer", va, prologue, sizeof prologue)) return false;
+    uint8_t *stub = alloc_stub(48), *p = stub; if (!stub) return false;
+    p = emit_flag_test(p, 12);
+    p = emit_mov(p, 0, fn); *p++ = 0xFF; *p++ = 0xE0;          // on:  jmp qt_*: returns straight to the caller
+    p = emit(p, prologue, sizeof prologue);                     // off: the game's own timer
+    p = emit_mov(p, 0, VA(va + sizeof prologue)); *p++ = 0xFF; *p++ = 0xE0;
+    if (!jmp_to_stub(what, va, sizeof prologue, stub)) return false;
+    s4log("qpctimer: %s hooked", what); return true;
+}
+static bool install_qpctimer(void) {
+    // the four readers of the timer state (0x148D31B10/B18/AEC); nothing else touches it
+    static const uint8_t pace_e[] = { 0x83,0x3D,0x98,0x41,0xB9,0x08,0x00, 0x0F,0x84,0xDD,0x00,0x00,0x00 };  // cmp [ok],0 ; jz
+    static const uint8_t pace_next[] = { 0x49,0x2B,0x86,0x30,0x01,0x00,0x00 };     // 0x14019DA5D: sub rax, [r14+130h]
+    static const uint8_t ctor_e[] = { 0x48,0x89,0x5C,0x24,0x50 };                  // 0x1401B688B: mov [rsp+50h], rbx
+    static const uint8_t ctor_store[] = { 0x41,0x89,0xBE,0xDC,0x00,0x00,0x00, 0x49,0x8B,0xC6 };  // mov [r14+0DCh], edi ; mov rax, r14
+    if (!check_bytes("qpctimer", 0x14019D961, pace_e, sizeof pace_e) || !check_bytes("qpctimer", 0x14019DA5D, pace_next, sizeof pace_next) ||
+        !check_bytes("qpctimer", 0x1401B688B, ctor_e, sizeof ctor_e) || !check_bytes("qpctimer", 0x1401B6985, ctor_store, sizeof ctor_store) ||
+        !in_exe(0x148D31AEC, 0x30)) return false;
+    g_tm_ok = (int32_t *)VA(0x148D31B00); g_tm_base = (int64_t *)VA(0x148D31B10);
+    g_tm_freq = (int64_t *)VA(0x148D31B08); g_tm_tick0 = (uint32_t *)VA(0x148D31AEC);
+    if (!qt_hook_entry("GetMicroSecond 0x14017E180", 0x14017E180, (void *)qt_us) ||
+        !qt_hook_entry("GetMilliSecond 0x14017E050", 0x14017E050, (void *)qt_ms)) return false;
+    // present pacing loop: the loop head reads the clock inline into RAX, then continues at 0x14019DA5D
+    uint8_t *s = alloc_stub(80), *p = s; if (!s) return false;
+    p = emit_flag_test(p, 24);
+    p = emit_mov(p, 0, (void *)qt_us); *p++ = 0xFF; *p++ = 0xD0;                // call qt_us (RSP is 16-aligned here)
+    p = emit_mov(p, 1, VA(0x14019DA5D)); *p++ = 0xFF; *p++ = 0xE1;
+    p = emit_mov(p, 0, (void *)g_tm_ok);                                        // off: cmp [ok],0 ; jz/jmp as the game did
+    { const uint8_t t[] = { 0x83, 0x38, 0x00, 0x75, 0x0C }; p = emit(p, t, sizeof t); }
+    p = emit_mov(p, 0, VA(0x14019DA4B)); *p++ = 0xFF; *p++ = 0xE0;
+    p = emit_mov(p, 0, VA(0x14019D96E)); *p++ = 0xFF; *p++ = 0xE0;
+    if (!jmp_to_stub("pacing loop", 0x14019D961, sizeof pace_e, s)) return false;
+    // timer object ctor: stores the millisecond time at [r14+0DCh] after the "QPC available" check
+    s = alloc_stub(64); p = s; if (!s) return false;
+    p = emit_flag_test(p, 31);
+    p = emit_mov(p, 0, (void *)qt_ms); *p++ = 0xFF; *p++ = 0xD0;                // call qt_ms
+    { const uint8_t t[] = { 0x41, 0x89, 0x86, 0xDC, 0x00, 0x00, 0x00 }; p = emit(p, t, sizeof t); }  // mov [r14+0DCh], eax
+    p = emit_mov(p, 1, VA(0x1401B698C)); *p++ = 0xFF; *p++ = 0xE1;              // the ctor's epilogue
+    p = emit(p, ctor_e, sizeof ctor_e);                                         // off: the game's code
+    p = emit_mov(p, 0, VA(0x1401B6890)); *p++ = 0xFF; *p++ = 0xE0;
+    if (!jmp_to_stub("timer ctor", 0x1401B688B, sizeof ctor_e, s)) return false;
+    s4log("qpctimer: pacing loop 0x14019D961 and timer ctor 0x1401B688B hooked"); return true;
+}
+
 // ================================================================ fixes 4 and 6: SetThreadAffinityMask (IAT hook)
 // timeraffinity: the QPC timer helpers pin the calling thread to CPU 0 around every read and restore it afterwards.
 //   Only those call sites (by return address) on the current-thread pseudo-handle are skipped; QPC itself is unchanged.
@@ -740,6 +820,7 @@ static void startup(void) {
         case 8: ok = install_anim60fix(); break;
         case 9: ok = install_guardfix(); break;
         case 10: ok = install_audiocrash(); break;
+        case 11: ok = install_qpctimer(); break;
         }
         g_hooked[i] = ok;
         s4log("%s %s", ok ? "OK  " : "FAIL", kFixNames[i]);
