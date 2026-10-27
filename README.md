@@ -142,6 +142,27 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 
 ## Bug Fix History
 
+### 1.10.0
+
+- New fix `fps60` (on by default) for games set to 60 FPS (config.ini `fps=60`). Some game code counts frames where it
+  should count time, so at 60 it runs twice as fast; storm4perf rescales those spots to the current FPS. At 30 FPS
+  every value is the game's own. No game data files are changed. Groups (all on, each can be turned off):
+  - `fps60_menu`: a short press in a menu sometimes moved the cursor two entries, and now and then a press was lost.
+    The Flash menus read the pad only on the frames their 30 FPS movie ticks, and the game keeps last frame's pad
+    state for them, so one press was read twice when the movie ticked on two frames in a row and lost when it skipped
+    both. Every press is now kept until the next frame a menu reads and given to it once. `fps60_menu_neutral`
+    (default 2 frames) also ignores a new press of a button released for less than that, so a bouncing d-pad or a
+    stick flicking past its threshold does not step twice. Verified in game at 60: 96 taps, the game alone read 106
+    presses, storm4perf delivered 96 and the cursor moved 96 entries. Character select was already correct.
+  - `fps60_substitution`: the slow-motion when a substitution triggers lasted 117 ms at 60 instead of 238 ms; now
+    205 ms (the rest is the engine's normal 2-frame state change).
+  - `fps60_camera`: the duel camera hold and several camera smoothing steps (hell rescue, team ultimate, camera
+    manipulator, view blend) ran twice as fast.
+  - `fps60_effects`: a per-character fade and one character's wing/spine model blend ran twice as fast.
+  - `fps60_springs`: hair, cloth and accessory spring bones settled twice as fast and trailed half as far behind.
+- Replays recorded at 60 FPS with 1.9.0 or older may play back differently with `fps60` on (substitution timing
+  changed). 30 FPS replays are unaffected.
+
 ### 1.9.0
 
 - New fix `qpctimer` (on by default): the game's timer could stop for the rest of the session, or jump by days, if a
