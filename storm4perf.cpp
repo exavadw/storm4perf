@@ -25,7 +25,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  // Windows 10 1803+
 #endif
 
-#define S4P_VERSION "1.10.0"
+#define S4P_VERSION "1.11.0"
 
 // ---------------------------------------------------------------- logging
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -135,7 +135,9 @@ static void **find_iat(const char *dll, const char *fn) {
 }
 
 static LARGE_INTEGER g_qpf;
-static int64_t qpc_us(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000000 / g_qpf.QuadPart; }
+// ticks * 1e6 overflows int64 after ~10.7 days of uptime at a 10 MHz QPC, so split into seconds and remainder
+static int64_t qpc_to_us(int64_t t) { int64_t f = g_qpf.QuadPart; return t / f * 1000000 + t % f * 1000000 / f; }
+static int64_t qpc_us(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return qpc_to_us(t.QuadPart); }
 
 // ================================================================ fix 1: GPU frame timer without the blocking readback
 // The render manager (vtable 0x1412F8F60) brackets each frame with two TIMESTAMP queries and a DISJOINT query:
@@ -639,6 +641,7 @@ static bool install_affinity(bool timer, bool bullet) {
 #include "storm4perf_ui.cpp"
 #include "storm4perf_guardfix.cpp"
 #include "storm4perf_fps60.cpp"
+#include "storm4perf_lowlat.cpp"
 extern "C" bool s4p_replay_attach(const wchar_t *dir, const wchar_t *ini);  // replay/storm4perf_replay.cpp
 
 // ================================================================ crash and error logging
@@ -720,7 +723,8 @@ extern "C" DWORD (*s4p_pad_filter)(DWORD pad, void *state, DWORD result) = NULL;
 extern "C" __declspec(dllexport) DWORD WINAPI XInputGetState(DWORD i, void *s) {
     x_ensure();
     LONG call_n = InterlockedIncrement(&g_getstate_calls);
-    DWORD r = x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED;
+    ll_on_pad_read();  // storm4perf_lowlat.cpp: frame timing (and the latent wait) before the read
+    DWORD r = g_ll_block ? ll_blocked_pad(i, s) : x_get ? x_get(i, s) : ERROR_DEVICE_NOT_CONNECTED;
     if (call_n <= 3 || call_n % 600 == 0)
         s4log("xinput: GetState call #%ld pad=%u ret=%lu", call_n, i, r);
     if (g_virtual_pad && i == 0 && s && r == ERROR_SUCCESS) {
@@ -763,6 +767,7 @@ static DWORD WINAPI bg_thread(void *) {
             last = fa.ftLastWriteTime; LONG want[NFIX]; read_fix_flags(want); apply_flags(want, false); gpu_live_change();
         }
         enforce_input_delay();
+        lowlat_tick();
         if (GetTickCount() - last_stats >= 300000) { last_stats = GetTickCount(); log_stats("5 min"); }
     }
 }
@@ -830,6 +835,7 @@ static void startup(void) {
         if (ok) g_installed_any = 1;
     }
     install_gpu();
+    install_lowlat();
     if (GetPrivateProfileIntW(L"replay", L"enabled", 1, g_ini)) {
         bool rp = s4p_replay_attach(g_dir, g_ini);
         s4log("%s replays (log: StormReplay\\logs\\replay.log)", rp ? "OK  " : "FAIL");
