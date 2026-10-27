@@ -147,6 +147,23 @@ static volatile LONG g_ll_latency_set = -1;   // frame latency applied to the ga
 static __declspec(thread) int t_ll_in_present;
 static LONG g_ll_last_presented = 0;
 
+// [lowlat] no_focus=1 (test copies without the StormStory runtime): the game pauses when it loses focus, and a test copy
+// must never keep focus. At the first Present the window is subclassed (deactivation dropped, WS_EX_NOACTIVATE), and
+// the window that had focus at load gets it back. Same as stormab's take_window.
+static int g_ll_no_focus; static HWND g_ll_launch_fg; static WNDPROC g_ll_orig_wndproc;
+static LRESULT CALLBACK ll_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_KILLFOCUS) return 0;
+    if (msg == WM_ACTIVATEAPP && w == FALSE) return 0;
+    if (msg == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) return 0;
+    return CallWindowProcW(g_ll_orig_wndproc, h, msg, w, l);
+}
+static void ll_take_window(HWND hw) {
+    g_ll_orig_wndproc = (WNDPROC)SetWindowLongPtrW(hw, GWLP_WNDPROC, (LONG_PTR)&ll_wndproc);
+    SetWindowLongPtrW(hw, GWL_EXSTYLE, GetWindowLongPtrW(hw, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+    bool gave_back = GetForegroundWindow() == hw && g_ll_launch_fg && IsWindow(g_ll_launch_fg) && SetForegroundWindow(g_ll_launch_fg);
+    s4log("lowlat: window %p subclassed (runs unfocused, never keeps focus)%s", (void *)hw, gave_back ? ", focus handed back" : "");
+}
 static void ll_apply_latency(void) {
     LONG want = g_ll_mode == LL_LATENCY1 ? 1 : 3;
     if (!g_ll_dev || g_ll_latency_set == want) return;
@@ -172,7 +189,21 @@ static void ll_make_markers(IDXGISwapChain *sc) {
         if (FAILED(g_ll_dev->CreateTexture2D(&m, &s, &g_ll_mark[c]))) { s4log("lowlat: marker texture failed (format %u)", d.Format); return; }
     }
 }
+static const char *ll_mod_of(const void *a) {  // "module+0xoffset" for logs
+    static char b[4][MAX_PATH]; static int i; i = (i + 1) & 3; HMODULE m = NULL; b[i][0] = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m)) {
+        char p[MAX_PATH]; GetModuleFileNameA(m, p, MAX_PATH); const char *q = strrchr(p, '\\');
+        sprintf_s(b[i], "%s+0x%llx", q ? q + 1 : p, (unsigned long long)((uint8_t *)a - (uint8_t *)m));
+    } else sprintf_s(b[i], "%p", a);
+    return b[i];
+}
+static __declspec(thread) int t_ll_depth;
 static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    struct Depth { Depth() { t_ll_depth++; } ~Depth() { t_ll_depth--; } } depth_;
+    if (t_ll_depth >= 3) {
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 3) s4log("lowlat: Present re-entered at depth %d from %s (next %s)", t_ll_depth, ll_mod_of(_ReturnAddress()), ll_mod_of((void *)ll_real_present));
+    }
     if (t_ll_in_present || (g_ll_sc && sc != g_ll_sc)) return ll_real_present(sc, sync, flags);
     t_ll_in_present = 1;
     if (!g_ll_sc) {
@@ -184,6 +215,7 @@ static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT 
             if (g_ll_measure) ll_make_markers(sc);
         }
         g_ll_sc = sc; g_ll_hwnd = sd.OutputWindow;
+        if (g_ll_no_focus) ll_take_window(g_ll_hwnd);
     }
     ll_apply_latency();
     LONG f = g_ll_frame; int64_t t0 = qpc_us();
@@ -222,6 +254,7 @@ static bool ll_hook_present(void) {
     IDXGISwapChain *sc = NULL; ID3D11Device *dev = NULL; ID3D11DeviceContext *ctx = NULL; bool ok = false;
     if (SUCCEEDED(D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, NULL, &ctx))) {
         void **vt = *(void ***)sc; DWORD old;
+        s4log("lowlat: Present slot holds %s", ll_mod_of(vt[8]));
         if (VirtualProtect(&vt[8], sizeof(void *), PAGE_EXECUTE_READWRITE, &old)) {
             ll_real_present = (LlPresentFn)vt[8]; vt[8] = (void *)ll_present; VirtualProtect(&vt[8], sizeof(void *), old, &old); ok = true;
         }
@@ -370,8 +403,8 @@ static void ll_set_ab(int i) {
 }
 static DWORD WINAPI ll_thread(void *) {
     ll_thread_dpi_aware();
-    while (g_ll_frame < 30) Sleep(250);       // the game's main loop (and swapchain) is running
-    Sleep(4000);
+    if (g_ll_no_focus) Sleep(1500);           // early, so the window is taken before it can keep focus (as stormab does)
+    else { while (g_ll_frame < 30) Sleep(250); Sleep(4000); }  // the game's main loop (and swapchain) is running
     if (!ll_hook_present()) return 0;
     while (!g_ll_hwnd) Sleep(100);
     if (!ll_find_output()) { s4log("ERROR lowlat: no output for the game window; latent and measure are off"); InterlockedExchange(&g_ll_mode, LL_OFF); return 0; }
@@ -450,6 +483,8 @@ static void install_lowlat(void) {
     g_ll_offset_us = (LONG)(int)GetPrivateProfileIntW(L"lowlat", L"latent_offset_us", (UINT)-2000, g_ini);
     g_ll_measure = GetPrivateProfileIntW(L"lowlat", L"measure", 0, g_ini);
     g_ll_block = GetPrivateProfileIntW(L"lowlat", L"block_real_input", 0, g_ini);
+    g_ll_no_focus = GetPrivateProfileIntW(L"lowlat", L"no_focus", 0, g_ini);
+    if (g_ll_no_focus) { HWND fg = GetForegroundWindow(); DWORD fp = 0; GetWindowThreadProcessId(fg, &fp); g_ll_launch_fg = fp != GetCurrentProcessId() ? fg : NULL; }
     g_ll_ab_ms = GetPrivateProfileIntW(L"lowlat", L"ab_seconds", 20, g_ini) * 1000;
     g_ll_win_x = (int)GetPrivateProfileIntW(L"lowlat", L"window_x", (UINT)-1, g_ini);
     g_ll_win_y = (int)GetPrivateProfileIntW(L"lowlat", L"window_y", (UINT)-1, g_ini);
@@ -468,7 +503,7 @@ static void install_lowlat(void) {
     bool uses_latent = false; for (int i = 0; i < g_ll_nab; i++) uses_latent |= g_ll_ab[i].mode == LL_LATENT;
     if (uses_latent && g_ll_vsync_on) s4log("note lowlat: latent needs in-game vsync=0 (config.ini); it stays off while vsync=1");
     if (g_ll_block) ll_block_keyboard("load");
-    bool any = g_ll_measure || g_ll_nab > 1 || g_ll_mode != LL_OFF;
+    bool any = g_ll_measure || g_ll_nab > 1 || g_ll_mode != LL_OFF || g_ll_no_focus;
     s4log("%s lowlat: mode %s@%d%s measure=%d block_real_input=%d (vsync=%d fps=%d)", any ? "OK  " : "off ", kLlNames[g_ll_mode],
           g_ll_offset_us, g_ll_nab > 1 ? " (A/B list)" : "", g_ll_measure, g_ll_block, g_ll_vsync_on, g_ll_fps);
     if (!any) return;
