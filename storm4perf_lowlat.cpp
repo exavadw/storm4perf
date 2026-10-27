@@ -21,8 +21,9 @@
 //   early     (1.09) Present each frame from the render thread the moment it has drawn it, instead of at the start of the
 //             next game tick. The engine's order per tick is: pad read, update (records draw commands), Present (of the
 //             previous image), kick of the new commands, render thread draws them; so a drawn frame waited most of a
-//             tick (~33 ms at 30 FPS) in the back buffer for the next tick's Present. The main thread's own Present is skipped when the render thread already presented. Hooked at the
-//             render job's end (0x14018C8E2, shared with flipwait), under the job's lock, so the next kick waits for it.
+//             tick (~33 ms at 30 FPS) in the back buffer for the next tick's Present. The main thread's own Present is
+//             skipped when the render thread already presented. Hooked at the render job's end (0x14018C8E2, shared with
+//             flipwait), after the job lock is released, under the engine's immediate-context lock (*(mgr+0x78)).
 //   elatent   early + latent: the frame start is held so the render thread's Present lands latent_offset_us before a
 //             refresh.
 //
@@ -60,11 +61,13 @@ static LlMode g_ll_ab[8]; static int g_ll_nab, g_ll_ab_ms;
 //            Storm 1 polls XInput only for connected pads, so there the post-frame function nuccSys::Update calls after
 //            its limiter is hooked instead);
 //   kick   = mmDrawCommandManager FrameEnd (hands the tick's draw commands to the render thread);
-//   clear  = render job end: `mov byte [rbx+88h],0` before `call [LeaveCriticalSection]` (at clear + 14).
-struct LlGame { const char *name; DWORD ts, size; uint64_t frame, kick, clear; };
+//   clear  = render job end: `mov byte [rbx+88h],0` before `call [LeaveCriticalSection]` (at clear + 14);
+//   mgr    = the mmDrawCommandManager pointer; *(mgr+0x78) is the lock every thread but the render thread takes before it
+//            uses the D3D immediate context (resource updates while loading, ...).
+struct LlGame { const char *name; DWORD ts, size; uint64_t frame, kick, clear, mgr; };
 static const LlGame kLlGames[] = {
-    { "Storm 4 1.09", 0x5EF2F684, 0x8F1D000, 0, 0x14018D740, 0x14018C8D4 },
-    { "Storm 1 (Steam)", 0x58DB8286, 0xC67000, 0x1404A3B30, 0x14010E500, 0x14010D694 },
+    { "Storm 4 1.09", 0x5EF2F684, 0x8F1D000, 0, 0x14018D740, 0x14018C8D4, 0x148D32FD8 },
+    { "Storm 1 (Steam)", 0x58DB8286, 0xC67000, 0x1404A3B30, 0x14010E500, 0x14010D694, 0x140B8E598 },
 };
 static const LlGame *g_ll_game;
 static bool g_ll_frames_from_xinput = true;  // read by storm4perf.cpp's XInputGetState
@@ -328,15 +331,23 @@ static volatile LONG g_ll_main_sync;          // sync interval the game asks for
 static volatile LONG64 st_ll_early, st_ll_main_skipped, st_ll_main_through;
 static __declspec(thread) int t_ll_early;
 static DWORD g_ll_render_tid;
+// Called right after the render thread released the job lock (so no lock order with the main thread's kick). Present
+// uses the immediate context, which the engine guards with *(mgr+0x78) for every thread but the render thread; without
+// it a loading thread's resource update raced this Present and the NVIDIA driver faulted and hung (2026-10-27).
 static void ll_job_end(void) {
     g_ll_render_tid = GetCurrentThreadId();
     if (!ll_is_early(g_ll_mode) || !g_ll_sc) return;
+    uint8_t *mgr = g_ll_game ? *(uint8_t **)VA(g_ll_game->mgr) : NULL;
+    LPCRITICAL_SECTION ctx_cs = mgr ? *(LPCRITICAL_SECTION *)(mgr + 0x78) : NULL;
+    if (!ctx_cs) return;  // no lock to take: leave the Present to the game
+    EnterCriticalSection(ctx_cs);  // before g_ll_plock: a game Present that goes through may already hold ctx_cs
     AcquireSRWLockExclusive(&g_ll_plock);
     t_ll_early = 1;
     g_ll_sc->Present((UINT)g_ll_main_sync, 0);  // through the vtable, so ll_present does the bookkeeping
     t_ll_early = 0;
     InterlockedExchange(&g_ll_early_pending, 1); InterlockedIncrement64(&st_ll_early);
     ReleaseSRWLockExclusive(&g_ll_plock);
+    LeaveCriticalSection(ctx_cs);
 }
 static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     if (!t_ll_early && sc == g_ll_sc && !t_ll_in_present) {

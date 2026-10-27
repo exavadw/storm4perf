@@ -25,9 +25,10 @@ allows, so there is no Melee-style polling drift to fix.
 - `early`: the render thread presents at the end of its job (the `LeaveCriticalSection` after it clears the busy flag at
   `+0x88`, `0x14018C8E2`, the site `flipwait` also uses), still holding the job lock so the next kick waits for it. The
   main thread's next Present is skipped. If a job is late, the main thread's Present goes through as before.
-- `latent`: the start of each tick is held inside the tick's first pad read, so the Present lands `latent_offset_us`
-  before a refresh on an exact 2-refresh cadence; the pad read happens after the wait. Needs in-game vsync off.
-- `elatent`: both.
+- `latent` (test only, changes gameplay): the start of each tick is held inside the tick's first pad read, so the
+  Present lands `latent_offset_us` before a refresh on an exact 2-refresh cadence; the pad read happens after the wait.
+  Needs in-game vsync off. Replays can diverge under it (see Replays); on its own it is test only.
+- `elatent` (opt-in, changes gameplay timing): both.
 - `latency1`: `SetMaximumFrameLatency(1)` on the game's DXGI device. No effect windowed (no queue builds up there).
 - In fullscreen, `latent` presents with vsync (a no-vsync present 5 ms before the refresh would tear about 70% down the
   screen). Not measured.
@@ -73,6 +74,11 @@ Present that carries the image; their absolute values are 33.3 ms low and their 
 
 ## A hang, and why `gputimer` is required
 
+Loading a four-character battle with `early` once crashed the NVIDIA driver inside the early Present and hung the game:
+other threads (resource updates while loading) take the draw manager's lock at `+0x78` before using the D3D immediate
+context, and the early Present did not. It now takes that lock (after releasing the job lock, so the locks are never
+held together); the same load then ran clean twice.
+
 Without storm4perf's `gputimer` fix, `elatent` hung the game within seconds in battle: the render thread was spinning in
 the game's GPU-timer readback (`0x14019F400`, `GetData` until the GPU answers) and the main thread in
 `nummSkinningThreadGPU::WaitForEnd`. With `gputimer` alone, `elatent` ran 5 minutes of battle without a stall; with
@@ -81,8 +87,17 @@ threads' stacks if the pad reads stop for 3 s.
 
 ## Replays
 
-Each replay checks every frame against the recording; `replay.log` says `IDENTICAL` when it matches to the end. The
-showcase replay and a long Team Battle replay play back `IDENTICAL` with `off`, `early` and `elatent`.
+Each replay checks every frame against the recording; `replay.log` says `IDENTICAL` when it matches to the end.
+
+| replay | `off` | `early` | `elatent` |
+|---|---|---|---|
+| guardfix showcase (568 inputs), 30 FPS | IDENTICAL 4/4 | IDENTICAL 4/5, 1 DIVERGED at tick 222 | DIVERGED at tick 222 (346 ticks) |
+| 2026-10-18 Team Battle, 60 FPS | DIVERGED at tick 76 (recorded with an older mod version) | DIVERGED at tick 76 and 55 | not run |
+
+`early` only moves the Present, yet one of five playbacks drifted at exactly the tick where `elatent` drifts, so some
+simulation input in that replay depends on frame timing. Holding the start of a tick (`latent`) changes it reliably: the
+simulation reads something from the clock (the engine's 60 Hz VSync callback thread feeds per-tick counters into gameplay;
+Storm 1's code is known to multiply by such a counter), so `elatent` ships as an opt-in with that warning and `latent` alone stays test only.
 
 ## Storm 1
 

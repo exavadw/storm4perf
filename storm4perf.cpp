@@ -283,11 +283,11 @@ static bool install_skinwait(void) {
 typedef char (*FlipFn)(void *);
 typedef void (WINAPI *LeaveCsFn)(LPCRITICAL_SECTION);
 static FlipFn g_flip; static void **g_flip_mgr; static LeaveCsFn *g_leave_slot; static bool g_wake_ok, g_jobend_ok;
-static void (*g_jobend_cb)(void);  // render thread, job done, still holding the job critical section
+static void (*g_jobend_cb)(void);  // render thread, job done, right after it released the job critical section
 static volatile LONG64 st_flip_waits;
 static void leave_and_wake(LPCRITICAL_SECTION cs) {
-    if (g_jobend_cb) g_jobend_cb();
     (*g_leave_slot)(cs);  // through the exe's IAT slot, so other hooks on it still run
+    if (g_jobend_cb) g_jobend_cb();
     void *mgr = g_flip_mgr ? *g_flip_mgr : NULL;
     if (mgr) WakeByAddressAll((uint8_t *)mgr + 0x88);
 }
