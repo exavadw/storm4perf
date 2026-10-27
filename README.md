@@ -139,6 +139,18 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 
 ## Bug Fix History
 
+### 1.9.0
+
+- New fix `qpctimer` (on by default): the game's timer could stop for the rest of the session, or jump by days, if a
+  game thread was delayed for more than 100 ms in the middle of a timer read (heavy load, a debugger, a suspended
+  process). With vsync off the game's animation clock then stops; with vsync on the frame pacing can hang. The game's
+  timer, and its two inlined copies, now read plain `QueryPerformanceCounter` time. Verified in game: a 150 ms stall
+  froze the clock without the fix and changes nothing with it; FPS and CPU use are unchanged; replays still play back
+  identically (the 1.8.1 showcase replay: 548/548 inputs, 0 mismatches). Works alongside StormStory's own clock fix.
+- Replays: both controllers control the same pause menu (either Start opens it, both move the cursor and use the
+  speed and frame-advance buttons). A missing or unplugged second controller no longer pauses the replay. The pause
+  menu no longer lists Command List and Combo List.
+
 ### 1.8.1
 
 - The replay feature's helper code (exe addresses, hooks, log, controller access, game properties, message text and
