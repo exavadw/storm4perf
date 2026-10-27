@@ -186,9 +186,8 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 
 - Lower input lag, optional (`[lowlat] mode=early` or `elatent`, with in-game vsync off): each frame is shown as soon
   as the render thread has drawn it instead of at the start of the next game frame. Measured in a Practice battle:
-  press to screen 65 ms -> 37 ms (`early`) / 34 ms (`elatent`). Both can change replay playback (see the section);
-  the default `off` does not.
-  Off by default.
+  press to screen 65 ms -> 37 ms (`early`) / 34 ms (`elatent`). Off by default. Both can change replay playback (see
+  the section); the default `off` does not.
 - storm4perf's microsecond clock overflowed after about 10.7 days of Windows uptime (QPC ticks x 1,000,000 in 64 bits);
   fixed.
 - On any exe other than Steam 1.09, the Storm 4 fixes, replays and options menu now stay off instead of only skipping
