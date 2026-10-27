@@ -52,15 +52,20 @@ log `StormReplay\logs\replay.log`. Settings, in `storm4perf.ini` under `[replay]
 
 How it works: a replay stores the battle setup and both players' inputs, and the game replays them, so a replay is
 the real battle again, not a video. Every frame is checked against the recording; `replay.log` says `IDENTICAL` when a
-replay matched to the end.
+replay matched to the end. A replay also stores both players' button layouts (Options > Controller Settings), so it
+plays the same moves when it is watched with a different layout, and the frame each round let the players move (the
+game times that on its menu clock, which can land a frame earlier or later from one run to the next).
 
 Known limits:
 - Replays play on the same game version and FPS setting they were recorded with (Steam 1.09).
 - Online battles are not recorded yet.
 - Replays recorded with an older version of this mod may drift from the original battle in the first seconds.
-- In testing, one battle started through Character Select drifted from its first seconds when watched (replays from
-  the list's Watch Again and battles started directly matched exactly). Send `StormReplay\logs\replay.log` and the
-  replay file if you see a replay that does not match the battle.
+- Replays recorded before 1.10.0 do not store the button layouts or the item-effects option (see 1.10.0 below): watch
+  them with the same Controller Settings layout and the same option they were recorded with, or they can drift.
+- The pause between rounds (KO, then the next round's intro) runs on the game's menu clock. If it takes a frame or two
+  longer or shorter than when the replay was recorded, the replay can drift from the start of the next round (seen in 1
+  of 2 viewings of a 60 FPS two-round replay; the first round matched in both).
+- Send `StormReplay\logs\replay.log` and the replay file if you see a replay that does not match the battle.
 
 ## What it changes
 
@@ -138,6 +143,26 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Bug Fix History
+
+### 1.10.0
+
+- **Replays keep the button layouts.** A replay stores both players' button layouts (Options > Controller Settings) and
+  plays the recorded moves even when it is watched with a different layout, the way online battles convert the other
+  player's buttons. Checked in game: a replay recorded with one layout, watched with two buttons swapped, plays back
+  identically.
+- **Fixed: replays at 60 FPS could drift from the first seconds.** The frame on which each round lets the players move
+  is timed by the game's menu clock, so it could land a frame earlier or later than in the recording, and every input
+  after it shifted. Replays now open the players' input on the recorded frame. This also applies to replays recorded
+  with older versions. This was the "battle started through Character Select drifted" case listed under Known limits.
+- **Fixed: an Options setting changed replays.** With the setting that shows items obtained in battle turned on, each
+  Ninja Treasure drop and pickup plays an effect at a random spot, and that spot comes from the battle's own random
+  numbers. A replay watched with the setting different from when it was recorded drifted from the first drop. Replays
+  now store the setting and use the recorded value for those effects only; your setting is not changed.
+- Checked in game at 60 FPS (1P vs COM team battle): fresh replays played back identically in all 7 viewings with this
+  version, including with two buttons swapped and with the setting changed (1.9.0 diverged in 1 of 2 viewings). A
+  two-round 1.8.0 replay that drifted from its first seconds now plays its first round identically when watched with
+  the layout and setting it was recorded with (both rounds in 1 of 2 viewings; see Known limits). The 1.8.1 showcase
+  replay still plays back identically.
 
 ### 1.9.0
 

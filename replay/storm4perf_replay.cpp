@@ -46,6 +46,39 @@ void first_frame() {
   g_ready = true;
 }
 
+#ifdef S4P_DEV
+// Test builds only (cl /DS4P_DEV): StormReplay\dev.cmd lines run on the game thread through replay::command, or
+// playback_ui::command for lines starting with "ui "; replies are appended to StormReplay\dev.out.
+void dev_commands() {
+  const auto cmd = g_cfg.root / L"dev.cmd";
+  std::error_code ec;
+  if (!std::filesystem::exists(cmd, ec)) return;
+  std::string lines;
+  if (FILE* f = _wfopen(cmd.c_str(), L"rb")) {
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) lines.append(buf, n);
+    fclose(f);
+  }
+  std::filesystem::remove(cmd, ec);
+  std::string out;
+  size_t at = 0;
+  while (at < lines.size()) {
+    size_t end = lines.find('\n', at);
+    std::string line = lines.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    at = end == std::string::npos ? lines.size() : end + 1;
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (line.empty()) continue;
+    const std::string reply = line.rfind("ui ", 0) == 0 ? playback_ui::command(line.substr(3)) : replay::command(line);
+    out += "> " + line + "\n< " + reply + "\n";
+  }
+  if (FILE* f = _wfopen((g_cfg.root / L"dev.out").c_str(), L"ab")) {
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+  }
+}
+#endif
+
 using RunCallbacksFn = void(__cdecl*)();
 RunCallbacksFn o_run_callbacks = nullptr;
 void __cdecl hk_run_callbacks() {
@@ -59,6 +92,9 @@ void __cdecl hk_run_callbacks() {
     ui::tick();
     launch::tick();
     browser::tick();
+#ifdef S4P_DEV
+    dev_commands();
+#endif
   }
   o_run_callbacks();
 }

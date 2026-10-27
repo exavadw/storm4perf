@@ -35,6 +35,20 @@ namespace ssr::replay {
 namespace {
 constexpr uintptr_t kRecorderGlobal = 0x1415F82E0;
 constexpr uintptr_t kRecord = 0x140524D6C;
+// Button layout: ccSaveData::GetButtonId 0x140865EC4(save, side, action) → that action's button mask (defaults filled
+// by InitKeyConfigDuel when empty). ccPlayerPad::Init 0x1407C0820 caches actions 0..7 for its side; Ctrl tests the raw
+// buttons (the recorded padFrame) against them. Online, ccNetManager::GetNetPad 0x1406B2470 converts the remote
+// player's buttons through their layout into the local one; playback does the same from the recorded layout.
+constexpr uintptr_t kSaveData = 0x14161FEB0, kGetButtonId = 0x140865EC4;
+// Input opening at each round start: the opening scene's teardown 0x1405AC484 (scene manager update 0x140AB5810) calls
+// EnableInput 0x14079AC14(leader) (leader+0xCAC = 1 unless +0xD50) for both sides, except online. The scene ends on UI
+// time, so the tick varies by one or two between runs at 60 FPS; every input after it then lands a tick early or late.
+constexpr uintptr_t kEnableInput = 0x14079AC14, kOpeningSceneCallRet = 0x1405AC4B6, kSceneManagerUpdate = 0x140AB5810;
+// An option that changes the battle's RNG: ccSaveData+0x120 (Options screen, ccUiOption 0x1406AC31B) gates the Ninja
+// Treasure drop effects and item notices. ccBattleDropItemManager::Update 0x1404AE9D8 then spawns an effect through
+// 0x1404BB800, which draws its position from the gameplay MT; the item notifier 0x14064348C does the same on pickup.
+// Playback runs those two with the recorded value and puts the viewer's back right after.
+constexpr uintptr_t kItemFxOption = 0x14161FFD0, kDropUpdate = 0x1404AE9D8, kItemNotify = 0x14064348C;
 constexpr uintptr_t kPlay = 0x140524DE8;
 constexpr uintptr_t kBattleMainInit = 0x1406D4FC4;  // void(scene*): battle-main base Initialize; passes RCX on to 0x1406D4BF8
 // Round 1's timer starts in the Begin scene: "Fight" 0x1405B8088(begin scene) sets duel+0x244 = 1 (HUD on, timer runs)
@@ -73,6 +87,60 @@ const char* mode_name(Mode m) {
 }
 
 Config g_cfg;
+#ifdef S4P_DEV
+uint32_t g_dev_ticklog = 0, g_dev_ticklog_left = 0, g_dev_ctrl[2]{}, g_dev_tick = 0;  // dev probes (see dev_after_judge)
+int64_t g_dev_last_qpc = 0;
+int g_dbp_side = -1;
+uint32_t g_dbp_off = 0;
+struct DevWatch {
+  int side;
+  uint32_t off;
+  int bytes;
+  uint32_t last = 0;
+  bool have = false;
+};
+std::vector<DevWatch> g_dev_watch;
+// dbp: a hardware write breakpoint (DR0, 4 bytes) on one address in the game thread; a vectored handler logs who wrote.
+uintptr_t g_dbp_addr = 0;
+std::atomic<int> g_dbp_hits{0};
+DWORD g_dbp_tid = 0;
+LONG CALLBACK dbp_handler(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+  e->ContextRecord->Dr6 = 0;
+  if (g_dbp_hits.fetch_add(1) < 40) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void* fr[12];
+    const USHORT n = RtlCaptureStackBackTrace(0, 12, fr, nullptr);
+    std::string st;
+    for (USHORT i = 0; i < n; ++i) {
+      const auto a = reinterpret_cast<uintptr_t>(fr[i]);
+      if (a >= base && a < base + 0x10000000) st += std::format(" {:#x}", a - base + 0x140000000);
+    }
+    log::info("dev dbp t={} write {:#x} -> {:#x} rip {:#x} stack{}", g_dev_tick, g_dbp_addr, *reinterpret_cast<uint32_t*>(g_dbp_addr),
+              e->ContextRecord->Rip - base + 0x140000000, st);
+  }
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+void dbp_set(uintptr_t addr) {  // called on the game thread: a helper thread suspends it and loads DR0/DR7
+  g_dbp_addr = addr;
+  g_dbp_tid = GetCurrentThreadId();
+  static bool veh = false;
+  if (!veh) veh = AddVectoredExceptionHandler(1, dbp_handler) != nullptr;
+  std::thread([addr, tid = g_dbp_tid] {
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    SuspendThread(t);
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    GetThreadContext(t, &c);
+    c.Dr0 = addr;
+    c.Dr7 = addr ? (1ull | (1ull << 16) | (3ull << 18)) : 0;  // L0, write, 4 bytes
+    SetThreadContext(t, &c);
+    ResumeThread(t);
+    CloseHandle(t);
+  }).detach();
+}
+#endif
 Mode g_mode = Mode::Idle;
 Recording g_rec;   // current or last finished recording
 Recording g_play;  // replay being watched
@@ -256,6 +324,107 @@ std::string summary() {
   return s;
 }
 
+// ---- button layout ----
+std::vector<uint32_t> current_keys() {
+  using GetButtonIdFn = uint32_t(__fastcall*)(void*, int, int);
+  std::vector<uint32_t> k(2 * kKeyActions);
+  for (int side = 0; side < 2; ++side)
+    for (int a = 0; a < static_cast<int>(kKeyActions); ++a)
+      k[side * kKeyActions + a] = game::at<GetButtonIdFn>(kGetButtonId)(game::at<void*>(kSaveData), side, a);
+  return k;
+}
+std::string keys_text(const std::vector<uint32_t>& k) {
+  std::string o;
+  for (size_t i = 0; i < k.size(); ++i) o += std::format("{}{:x}", i == 0 ? "" : i == kKeyActions ? " | " : " ", k[i]);
+  return o;
+}
+// Playback: the recorded layout → the viewer's, per side; empty when they match (or the file has no layout).
+std::vector<uint32_t> g_keys_from, g_keys_to;
+bool g_keys_translate[2]{};
+bool g_keys_dev_off = false;  // dev builds: "keys translate off" plays the recorded buttons untranslated (control runs)
+void prepare_keys() {
+  g_keys_translate[0] = g_keys_translate[1] = false;
+  if (g_play.keys.size() != 2 * kKeyActions) {
+    log::info("replay: no button layout in this file; recorded buttons are used as they are");
+    return;
+  }
+  g_keys_from = g_play.keys;
+  g_keys_to = current_keys();
+  for (int side = 0; side < 2; ++side)
+    g_keys_translate[side] = !std::equal(g_keys_from.begin() + side * kKeyActions, g_keys_from.begin() + (side + 1) * kKeyActions,
+                                         g_keys_to.begin() + side * kKeyActions);
+#ifdef S4P_DEV
+  if (g_keys_dev_off) {
+    log::info("replay: dev: layout translation off (recorded {} ; yours {})", keys_text(g_keys_from), keys_text(g_keys_to));
+    g_keys_translate[0] = g_keys_translate[1] = false;
+    return;
+  }
+#endif
+  if (g_keys_translate[0] || g_keys_translate[1])
+    log::info("replay: button layout differs (recorded {} ; yours {}); translating side {}{}", keys_text(g_keys_from), keys_text(g_keys_to),
+              g_keys_translate[0] ? "0" : "", g_keys_translate[1] ? (g_keys_translate[0] ? "+1" : "1") : "");
+}
+uint32_t translate_buttons(uint32_t w, int side) {
+  // As GetNetPad, but every button outside both layouts' action masks (sticks, triggers, d-pad) passes through as it is.
+  const uint32_t* from = &g_keys_from[side * kKeyActions];
+  const uint32_t* to = &g_keys_to[side * kKeyActions];
+  uint32_t mapped = 0;
+  for (size_t a = 0; a < kKeyActions; ++a) mapped |= from[a] | to[a];
+  uint32_t out = w & ~mapped;
+  for (size_t a = 0; a < kKeyActions; ++a)
+    if (w & from[a]) out |= to[a];
+  return out;
+}
+
+// ---- round-start input opening ----
+std::vector<uint32_t> g_opens;  // playback: ticks to open input on (recorded, or derived from the first inputs)
+size_t g_next_open = 0;
+void prepare_opens() {
+  g_next_open = 0;
+  g_opens = g_play.opens;
+  if (!g_opens.empty() || g_play.anchors.empty()) return;
+  // Older files: a human side's first Ctrl after a round's timer start is the tick its input opened.
+  for (size_t i = 0; i < g_play.anchors.size(); ++i) {
+    const Anchor& a = g_play.anchors[i];
+    const uint32_t until = i + 1 < g_play.anchors.size() ? g_play.anchors[i + 1].tick : UINT32_MAX;
+    uint32_t first = UINT32_MAX;
+    for (int side = 0; side < 2; ++side)
+      if (a.cursor0[side] < g_play.pad_tick[side].size()) first = (std::min)(first, g_play.pad_tick[side][a.cursor0[side]]);
+    if (first != UINT32_MAX && first >= a.tick && first < until && first < a.tick + 600) g_opens.push_back(first);
+    else {  // no human input to go by: leave every later round to the game as well
+      g_opens.clear();
+      return;
+    }
+  }
+}
+
+// ---- options that change the battle's random numbers ----
+bool g_opt_swap = false;  // playback: the recorded value differs from the viewer's
+uint32_t g_opt_rec = 0;
+bool g_opt_dev_off = false;  // dev builds: "opts swap off" leaves the viewer's value in place (control runs)
+void prepare_opts() {
+  g_opt_swap = false;
+  if (g_play.opts.empty()) return;
+  g_opt_rec = g_play.opts[0];
+  const uint32_t mine = *game::at<const uint32_t*>(kItemFxOption);
+  g_opt_swap = mine != g_opt_rec && !g_opt_dev_off;
+  if (g_opt_swap) log::info("replay: item effects option was {} when recorded, yours is {}; the battle uses the recorded one", g_opt_rec, mine);
+}
+template <class F> void with_recorded_opts(F&& call) {
+  if (!(g_opt_swap && g_mode == Mode::Playing && !g_play_done)) return call();
+  auto& opt = *game::at<uint32_t*>(kItemFxOption);
+  const uint32_t mine = opt;
+  opt = g_opt_rec;
+  call();
+  opt = mine;
+}
+using DropUpdateFn = void(__fastcall*)(uint32_t*);
+DropUpdateFn o_drop_update = nullptr;
+void __fastcall hk_drop_update(uint32_t* mgr) { with_recorded_opts([&] { o_drop_update(mgr); }); }
+using ItemNotifyFn = void(__fastcall*)(uint8_t*);
+ItemNotifyFn o_item_notify = nullptr;
+void __fastcall hk_item_notify(uint8_t* self) { with_recorded_opts([&] { o_item_notify(self); }); }
+
 // ---- recording ----
 void start_recording() {
   g_rec = {};
@@ -281,6 +450,8 @@ void start_recording() {
   }
   auto* g = game::at<const uint8_t*>(kGlobalsBegin);
   g_rec.globals.assign(g, g + (kGlobalsEnd - kGlobalsBegin));
+  g_rec.keys = current_keys();
+  g_rec.opts = {*game::at<const uint32_t*>(kItemFxOption)};
   g_rec.segs.push_back(snapshot(g_rec));
   g_timer_running = false;
   install_object(1);
@@ -328,6 +499,9 @@ void start_playback() {
   g_round_start = 0;
   if (!g_norestore) restore(g_play.segs[0]);
   g_restart_pending = false;
+  prepare_keys();
+  prepare_opens();
+  prepare_opts();
   install_object(2);
   log::info("replay: playback started ({} ticks, {} rounds{})", g_play.hashes.size(), g_play.segs.size(), g_norestore ? ", no RNG restore" : "");
 }
@@ -401,6 +575,9 @@ ApplyFn o_apply = nullptr;
 
 void __fastcall hk_record(void* rec, uint32_t* frame, uint32_t side) {
   if (rec != g_obj) return o_record(rec, frame, side);
+#ifdef S4P_DEV
+  if (side < 2) ++g_dev_ctrl[side];
+#endif
   if (g_mode != Mode::Recording || side > 1) return;
   PadFrame f;
   std::memcpy(f.w, frame, sizeof f.w);
@@ -410,6 +587,9 @@ void __fastcall hk_record(void* rec, uint32_t* frame, uint32_t side) {
 
 void __fastcall hk_play(void* rec, uint32_t* frame, uint32_t side) {
   if (rec != g_obj) return o_play(rec, frame, side);
+#ifdef S4P_DEV
+  if (side < 2) ++g_dev_ctrl[side];
+#endif
   if (g_mode != Mode::Playing || g_play_done || side > 1) return;
   auto& c = g_cursor[side];
   if (c >= g_play.pads[side].size()) {
@@ -423,6 +603,8 @@ void __fastcall hk_play(void* rec, uint32_t* frame, uint32_t side) {
   const PadFrame& f = g_play.pads[side][c++];
   for (int i = 0; i < 9; ++i)
     if (i != 4) frame[i] = f.w[i];  // repeat (w[4]) is wall-clock based and not part of the native record either
+  if (g_keys_translate[side])
+    for (int i = 0; i < 4; ++i) frame[i] = translate_buttons(frame[i], static_cast<int>(side));  // on, off, press, release
 }
 
 void on_round_start(bool new_battle) {
@@ -458,6 +640,33 @@ void on_round_start(bool new_battle) {
   }
 }
 
+using EnableInputFn = void(__fastcall*)(uint8_t*);
+EnableInputFn o_enable_input = nullptr;
+void __fastcall hk_enable_input(uint8_t* leader) {
+  if (reinterpret_cast<uintptr_t>(_ReturnAddress()) == game::at<uintptr_t>(kOpeningSceneCallRet)) {
+    if (g_mode == Mode::Recording) {
+      const uint32_t t = static_cast<uint32_t>(g_rec.hashes.size());
+      if (g_rec.opens.empty() || g_rec.opens.back() != t) g_rec.opens.push_back(t);
+    } else if (g_mode == Mode::Playing && !g_play_done && g_next_open < g_opens.size()) {
+      return;  // playback opens input on the recorded tick instead (hk_scene_update)
+    }
+  }
+  o_enable_input(leader);
+}
+// Start of each frame, before the scenes update: the recorded opening happened in this phase of its tick.
+using SceneUpdateFn = uintptr_t(__fastcall*)(void*);
+SceneUpdateFn o_scene_update = nullptr;
+uintptr_t __fastcall hk_scene_update(void* mgr) {
+  if (g_mode == Mode::Playing && !g_play_done && g_next_open < g_opens.size() && g_tick >= g_opens[g_next_open]) {
+    using GetLeader = uint8_t*(__fastcall*)(int);
+    for (int side = 0; side < 2; ++side)
+      if (uint8_t* leader = game::at<GetLeader>(kGetPlayerLeader)(side)) o_enable_input(leader);
+    log::info("replay: input opened at tick {} (recorded {}{})", g_tick, g_opens[g_next_open], g_play.opens.empty() ? ", from the first inputs" : "");
+    ++g_next_open;
+  }
+  return o_scene_update(mgr);
+}
+
 uintptr_t __fastcall hk_battle_init(void* scene) {
   ++g_inits;
   const int wins = duel_wins();
@@ -476,10 +685,11 @@ RngDraw* g_rng_trace = nullptr;
 std::atomic<size_t> g_rng_n{0};
 std::atomic<bool> g_rng_on{false}, g_rng_armed{false};
 uint32_t g_rng_tick = 0;  // duel ticks since "Fight" (counted in hk_judge while tracing)
+uint32_t g_rng_from = 0;  // dev: first traced tick (rngtrace arm [from])
 using GenrandFn = uint32_t(__fastcall*)();
 GenrandFn o_genrand = nullptr;
 uint32_t __fastcall hk_genrand() {
-  if (g_rng_on.load(std::memory_order_relaxed)) {
+  if (g_rng_on.load(std::memory_order_relaxed) && g_rng_tick >= g_rng_from) {
     const size_t i = g_rng_n.fetch_add(1, std::memory_order_relaxed);
     if (i < kRngTraceCap) {
       RngDraw& d = g_rng_trace[i];
@@ -499,6 +709,10 @@ bool g_ai_track = false;          // set at Fight (g_started_at_fight is cleared
 using AiDecideFn = uint64_t(__fastcall*)(uint8_t*);
 AiDecideFn o_ai_decide = nullptr;
 uint64_t __fastcall hk_ai_decide(uint8_t* ai) {
+#ifdef S4P_DEV
+  if (g_dev_ticklog_left) log::info("dev ai t={} ai={:#x} countdown={:.5f}", g_dev_tick, reinterpret_cast<uintptr_t>(ai) & 0xFFFFFF,
+                                    *reinterpret_cast<float*>(ai + kAiCountdown));
+#endif
   if (g_ai_track && std::find(g_ai_seen.begin(), g_ai_seen.end(), ai) == g_ai_seen.end()) {
     const size_t i = g_ai_seen.size();
     g_ai_seen.push_back(ai);
@@ -512,6 +726,21 @@ uint64_t __fastcall hk_ai_decide(uint8_t* ai) {
 using FightFn = void(__fastcall*)(void*);
 FightFn o_fight = nullptr;
 void __fastcall hk_fight(void* begin) {
+#ifdef S4P_DEV
+  g_dev_tick = 0;
+  g_dev_last_qpc = 0;
+  g_dev_ticklog_left = g_dev_ticklog;
+  for (auto& w : g_dev_watch) w.have = false;
+  log::info("dev Fight");
+  if (g_dbp_side >= 0) {
+    using GetLeader = uint8_t*(__fastcall*)(int);
+    if (uint8_t* leader = game::at<GetLeader>(kGetPlayerLeader)(g_dbp_side)) {
+      g_dbp_hits = 0;
+      dbp_set(reinterpret_cast<uintptr_t>(leader + g_dbp_off));
+      log::info("dev dbp on {:#x} (side {} +{:#x})", reinterpret_cast<uintptr_t>(leader + g_dbp_off), g_dbp_side, g_dbp_off);
+    }
+  }
+#endif
   if (g_rng_armed.exchange(false)) {
     g_rng_n = 0;
     g_rng_tick = 0;
@@ -660,6 +889,35 @@ int __fastcall hk_pause_action(void* menu) {
 }
 
 
+#ifdef S4P_DEV
+// Test builds only: watch leader fields per duel tick, and log tick pacing / Ctrl calls for the first ticks after Fight.
+void dev_after_judge() {
+  ++g_dev_tick;
+  using GetLeader = uint8_t*(__fastcall*)(int);
+  for (auto& w : g_dev_watch) {
+    uint8_t* leader = game::at<GetLeader>(kGetPlayerLeader)(w.side);
+    if (!leader) continue;
+    uint32_t v = 0;
+    std::memcpy(&v, leader + w.off, w.bytes);
+    if (!w.have || v != w.last) log::info("dev watch t={} side{} +{:#x} = {:#x}", g_dev_tick, w.side, w.off, v);
+    w.last = v;
+    w.have = true;
+  }
+  if (g_dev_ticklog_left) {
+    --g_dev_ticklog_left;
+    LARGE_INTEGER q, f;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    const double dt = g_dev_last_qpc ? (q.QuadPart - g_dev_last_qpc) * 1000.0 / f.QuadPart : 0.0;
+    log::info("dev tick t={} dt={:.2f}ms ctrl={}/{}", g_dev_tick, dt, g_dev_ctrl[0], g_dev_ctrl[1]);
+  }
+  g_dev_ctrl[0] = g_dev_ctrl[1] = 0;
+  LARGE_INTEGER q;
+  QueryPerformanceCounter(&q);
+  g_dev_last_qpc = q.QuadPart;
+}
+#endif
+
 uintptr_t __fastcall hk_judge(void* judge) {
   if (++g_pre_fight_ticks == 1) {  // the battle's first duel tick: the intro (and the CPU AI) start drawing from here
     if ((g_mode == Mode::ArmedPlay || g_mode == Mode::Playing) && !g_play.pre.empty() && !g_norestore) {
@@ -670,8 +928,11 @@ uintptr_t __fastcall hk_judge(void* judge) {
       g_pre_have = true;
     }
   }
-  if (g_rng_on && ++g_rng_tick > 300) g_rng_on = false;  // tick k's draws are tagged k-1 (hook runs before o_judge)
+  if (g_rng_on && ++g_rng_tick > g_rng_from + 300) g_rng_on = false;  // tick k's draws are tagged k-1 (hook runs before o_judge)
   const uintptr_t r = o_judge(judge);
+#ifdef S4P_DEV
+  dev_after_judge();
+#endif
   const bool running = *reinterpret_cast<const int*>(static_cast<const uint8_t*>(judge) + 0xD4) != 0;  // round timer counts
   const bool timer_starts = running && !g_timer_running;
   g_timer_running = running;
@@ -754,6 +1015,12 @@ void install(const Config& cfg) {
   hooks::install("MT::genrand", game::at(kGenrand), reinterpret_cast<void*>(&hk_genrand), reinterpret_cast<void**>(&o_genrand));
   hooks::install("BattleBegin::Fight", game::at(kFight), reinterpret_cast<void*>(&hk_fight), reinterpret_cast<void**>(&o_fight));
   hooks::install("ccDuelJudge::Update", game::at(kJudgeUpdate), reinterpret_cast<void*>(&hk_judge), reinterpret_cast<void**>(&o_judge));
+  hooks::install("ccPlayer::EnableInput", game::at(kEnableInput), reinterpret_cast<void*>(&hk_enable_input), reinterpret_cast<void**>(&o_enable_input));
+  hooks::install("ccBattleDropItemManager::Update", game::at(kDropUpdate), reinterpret_cast<void*>(&hk_drop_update),
+                 reinterpret_cast<void**>(&o_drop_update));
+  hooks::install("ItemNotify", game::at(kItemNotify), reinterpret_cast<void*>(&hk_item_notify), reinterpret_cast<void**>(&o_item_notify));
+  hooks::install("ccSceneManager::Update", game::at(kSceneManagerUpdate), reinterpret_cast<void*>(&hk_scene_update),
+                 reinterpret_cast<void**>(&o_scene_update));
   hooks::install("BattleEnd::MenuState", game::at(kEndMenuState), reinterpret_cast<void*>(&hk_end_menu),
                  reinterpret_cast<void**>(&o_end_menu));
   hooks::install("PauseMenu::SelectedAction", game::at(kPauseAction), reinterpret_cast<void*>(&hk_pause_action),
@@ -911,7 +1178,8 @@ std::string command(const std::string& args) {
   }
   if (sub == "rngtrace") {  // dev: rngtrace arm | dump <file>
     if (!g_rng_trace) g_rng_trace = new RngDraw[kRngTraceCap];
-    if (rest == "arm") {
+    if (rest.rfind("arm", 0) == 0) {
+      g_rng_from = static_cast<uint32_t>(std::atoi(rest.c_str() + 3));
       g_rng_armed = true;
       return "ok armed: traces genrand callers from the next Fight for 300 ticks";
     }
@@ -934,6 +1202,63 @@ std::string command(const std::string& args) {
       fclose(f);
     }
     return std::format("ok {} draws -> {}", n, path.string());
+  }
+#ifdef S4P_DEV
+  if (sub == "watch") {  // dev: watch add <side> <offset hex> <bytes> | watch clear
+    std::istringstream a(rest);
+    std::string verb, off;
+    int side = 0, bytes = 4;
+    a >> verb >> side >> off >> bytes;
+    if (verb == "clear") g_dev_watch.clear();
+    else if (verb == "add" && !off.empty()) g_dev_watch.push_back({side, static_cast<uint32_t>(std::stoul(off, nullptr, 16)), std::clamp(bytes, 1, 4)});
+    return std::format("ok {} watches", g_dev_watch.size());
+  }
+  if (sub == "dbp") {  // dev: dbp <side> <offset hex> (arm at the next Fight) | dbp off
+    std::istringstream a(rest);
+    std::string off;
+    int side = 0;
+    a >> side >> off;
+    if (side < 0 || off.empty()) {
+      dbp_set(0);
+      g_dbp_side = -1;
+      return "ok dbp off";
+    }
+    g_dbp_side = side;
+    g_dbp_off = static_cast<uint32_t>(std::stoul(off, nullptr, 16));
+    return std::format("ok dbp armed for side {} +{:#x} at the next Fight", side, g_dbp_off);
+  }
+  if (sub == "opts") {  // dev: opts swap off|on
+    g_opt_dev_off = rest.find("off") != std::string::npos;
+    return std::format("ok option swap {}", g_opt_dev_off ? "off" : "on");
+  }
+  if (sub == "poke") {  // dev: poke <exe VA hex> <u32 hex>
+    std::istringstream a(rest);
+    std::string va, v;
+    a >> va >> v;
+    if (va.empty() || v.empty()) return "error usage: poke <va> <value>";
+    auto* p = game::at<uint32_t*>(std::stoull(va, nullptr, 16));
+    const uint32_t old = *p;
+    *p = static_cast<uint32_t>(std::stoul(v, nullptr, 16));
+    return std::format("ok {} {:#x} -> {:#x}", va, old, *p);
+  }
+  if (sub == "ticklog") {  // dev: ticklog <n>: log pacing and Ctrl calls for n duel ticks from each Fight
+    g_dev_ticklog = static_cast<uint32_t>(std::atoi(rest.c_str()));
+    return std::format("ok ticklog {}", g_dev_ticklog);
+  }
+#endif
+  if (sub == "keys") {  // dev: keys | keys set <side> <action> <mask hex> (writes the save data's layout, as Options does)
+    std::istringstream a(rest);
+    std::string verb;
+    int side = -1, action = -1;
+    std::string mask;
+    a >> verb >> side >> action >> mask;
+    if (verb == "translate") g_keys_dev_off = rest.find("off") != std::string::npos;
+    if (verb == "set" && side >= 0 && side < 2 && action >= 0 && action < 24 && !mask.empty()) {
+      current_keys();  // fills defaults first, as GetButtonId does
+      auto* slot = game::at<uint32_t*>(kSaveData + 0x58) + side * 0x18 + action;
+      *slot = static_cast<uint32_t>(std::stoul(mask, nullptr, 16));
+    }
+    return "ok keys " + keys_text(current_keys()) + (g_play.keys.empty() ? "" : " | replay " + keys_text(g_play.keys));
   }
   if (sub == "stop") {
     if (g_mode == Mode::Recording) finish_recording("stop command");

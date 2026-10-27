@@ -1,7 +1,7 @@
 // .nsreplay container:
 //   "NSRP" u16 version(1) u16 flags(1 = XPRESS_HUFF body) u32 body_size u32 stored_size, then the body.
 //   body = chunks { char id[4]; u32 size; u8 data[size] }. Readers skip unknown chunks, so later versions stay readable.
-//   META (key=value lines) · BSP_ · GLOB · SEGS · ANC3 · PRE0 · AIT0 · PAD0/PAD1 · PTK0/PTK1 · HASH · JRAW
+//   META (key=value lines) · BSP_ · GLOB · SEGS · ANC3 · PRE0 · AIT0 · KEY0 · OPN0 · OPT0 · PAD0/PAD1 · PTK0/PTK1 · HASH · JRAW
 // Compression uses the Windows Compression API (cabinet.dll), so there is no extra dependency.
 #include <windows.h>
 #include <compressapi.h>
@@ -84,6 +84,9 @@ bool write_file(const std::wstring& path, const Recording& r, std::string* err) 
   w.vec("ANC3", r.anchors);
   if (!r.pre.empty()) w.vec("PRE0", r.pre);
   if (!r.ai_timers.empty()) w.vec("AIT0", r.ai_timers);
+  if (!r.keys.empty()) w.vec("KEY0", r.keys);
+  if (!r.opens.empty()) w.vec("OPN0", r.opens);
+  if (!r.opts.empty()) w.vec("OPT0", r.opts);
   w.vec("PAD0", r.pads[0]);
   w.vec("PAD1", r.pads[1]);
   w.vec("PTK0", r.pad_tick[0]);
@@ -190,6 +193,9 @@ bool read_file(const std::wstring& path, Recording& r, std::string* err) {
     else if (k == "ANC3") ok = take_vec(p, n, out.anchors);
     else if (k == "PRE0") ok = take_vec(p, n, out.pre);
     else if (k == "AIT0") ok = take_vec(p, n, out.ai_timers);
+    else if (k == "KEY0") ok = take_vec(p, n, out.keys) && out.keys.size() == 2 * kKeyActions;
+    else if (k == "OPN0") ok = take_vec(p, n, out.opens);
+    else if (k == "OPT0") ok = take_vec(p, n, out.opts);
     else if (k == "PAD0") ok = take_vec(p, n, out.pads[0]);
     else if (k == "PAD1") ok = take_vec(p, n, out.pads[1]);
     else if (k == "PTK0") ok = take_vec(p, n, out.pad_tick[0]);
