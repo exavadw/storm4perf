@@ -52,15 +52,23 @@ log `StormReplay\logs\replay.log`. Settings, in `storm4perf.ini` under `[replay]
 
 How it works: a replay stores the battle setup and both players' inputs, and the game replays them, so a replay is
 the real battle again, not a video. Every frame is checked against the recording; `replay.log` says `IDENTICAL` when a
-replay matched to the end.
+replay matched to the end. A replay also stores both players' button layouts (Options > Controller Settings), so it
+plays the same moves when it is watched with a different layout, and the frame each round let the players move (the
+game times that on its menu clock, which can land a frame earlier or later from one run to the next).
 
 Known limits:
 - Replays play on the same game version and FPS setting they were recorded with (Steam 1.09).
 - Online battles are not recorded yet.
 - Replays recorded with an older version of this mod may drift from the original battle in the first seconds.
-- In testing, one battle started through Character Select drifted from its first seconds when watched (replays from
-  the list's Watch Again and battles started directly matched exactly). Send `StormReplay\logs\replay.log` and the
-  replay file if you see a replay that does not match the battle.
+- Replays recorded before 1.12.0 do not store the button layouts or the item-effects option (see 1.12.0 below): watch
+  them with the same Controller Settings layout and the same option they were recorded with, or they can drift.
+- The pause between rounds (KO, then the next round's intro) runs on the game's menu clock. If it takes a frame or two
+  longer or shorter than when the replay was recorded, the replay can drift from the start of the next round (seen in 2
+  of 4 viewings of a 60 FPS two-round replay; the first round matched in all 4).
+- Sometimes a replay diverges from its very first frame (seen in 2 of 17 test viewings of 60 FPS replays); the same
+  replay matched when watched again. During the battle intro the CPU makes a different number of random rolls from one
+  viewing to the next, and occasionally that carries into the fight. Not fixed yet.
+- Send `StormReplay\logs\replay.log` and the replay file if you see a replay that does not match the battle.
 
 ## Lower input lag (optional)
 
@@ -181,6 +189,34 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Bug Fix History
+
+### 1.12.0
+
+- **Replays keep the button layouts.** A replay stores both players' button layouts (Options > Controller Settings) and
+  plays the recorded moves even when it is watched with a different layout, the way online battles convert the other
+  player's buttons. Checked in game: a replay recorded with one layout, watched with two buttons swapped, plays back
+  identically.
+- **Fixed: replays at 60 FPS could drift from the first seconds.** The frame on which each round lets the players move
+  is timed by the game's menu clock, so it could land a frame earlier or later than in the recording, and every input
+  after it shifted. Replays now open the players' input on the recorded frame. This also applies to replays recorded
+  with older versions. This was the "battle started through Character Select drifted" case listed under Known limits.
+- **Replays and `fps60`.** A replay records which `fps60` groups shaped its battle and is watched with the same ones,
+  then your `storm4perf.ini` settings come back. Replays recorded before `fps60` was released (1.10.0, 2026-10-27 10:54
+  UTC) are watched without it, so 60 FPS replays from 1.9.0 and older play back as recorded again (the 1.10.0 note
+  below). Replays from 1.10.0 and 1.11.0 do not say which groups were on and use yours, as before. Only the battle groups are applied (substitution, camera, effects); with `fps60=0` in `storm4perf.ini` a
+  replay recorded with `fps60` on cannot be matched and the log says so.
+- **Fixed: an Options setting changed replays.** With the setting that shows items obtained in battle turned on, each
+  Ninja Treasure drop and pickup plays an effect at a random spot, and that spot comes from the battle's own random
+  numbers. A replay watched with the setting different from when it was recorded drifted from the first drop. Replays
+  now store the setting and use the recorded value for those effects only; your setting is not changed.
+- Checked in game at 60 FPS (1P vs COM team battle): fresh replays played back identically in 15 of 17 viewings with this
+  version, including with two buttons swapped and with the setting changed; the other two diverged from their first
+  frame (see Known limits). 1.9.0 diverged in 1 of 2 viewings of the same file. A
+  two-round 1.8.0 replay that drifted from its first seconds now plays its first round identically when watched with
+  the layout and setting it was recorded with (both rounds in 2 of 4 viewings; see Known limits). The 1.8.1 showcase
+  replay still plays back identically. A replay recorded with `fps60` on, watched with its battle groups off in
+  `storm4perf.ini`, plays back identically (without switching them, it diverged at the first substitution); one
+  recorded without `fps60`, watched with it on, too.
 
 ### 1.11.0
 

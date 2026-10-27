@@ -137,6 +137,43 @@ static DWORD WINAPI f60_thread(void *) {
     }
 }
 
+// ---------------------------------------------------------------- replays
+// A replay records which groups shaped its battle (s4p_fps60_mask) and is watched with the same ones (s4p_fps60_force):
+// substitution timing and camera smoothing change what happens in the battle, so a 60 FPS replay recorded without fps60
+// drifts when watched with it, and the other way round. Only the battle groups are forced (substitution, camera,
+// effects); menus and spring bones stay as they are. The statics are preset here too, like at load: with a group off in
+// storm4perf.ini the game would compute them itself on first use (6000/fps for the substitution exits) and keep that
+// value. Forced off, the substitution exits get the game's own 6000/fps; forced on, fps60's 200.
+static int g_f60_ini_group[NGROUP];
+static bool g_f60_installed;
+static const int kF60BattleGroups = (1 << G_SUB) | (1 << G_CAM) | (1 << G_FX);
+extern "C" int s4p_fps60_mask(void) {  // bit g: group g is on and the game runs above 30 FPS with fps60 on
+    if (!g_f60_installed || !g_on.fps60) return 0;
+    int m = 0;
+    for (int g = 0; g < NGROUP; g++) if (g_f60_group_on[g]) m |= 1 << g;
+    return m;
+}
+static void f60_statics(int fps) {  // before f60_apply, which then sets the float ones for the groups
+    for (int i = 0; i < NS60; i++) {
+        const F60Static &st = kF60Statics[i];
+        if (!in_exe(st.va, 4) || !in_exe(st.guard, 4)) continue;
+        if (st.ival) *(volatile int32_t *)VA(st.va) = g_f60_group_on[st.group] ? st.ival : 6000 / fps;
+        else if (!g_f60_static_ok[i]) *(volatile float *)VA(st.va) = (float)(30.0 / fps * st.orig);
+        _InterlockedOr((volatile LONG *)VA(st.guard), st.bit);
+        g_f60_static_ok[i] = true;
+    }
+}
+// mask < 0: back to storm4perf.ini. Returns false when fps60 is not running (off in storm4perf.ini, or not installed).
+extern "C" bool s4p_fps60_force(int mask) {
+    if (!g_f60_installed || !g_on.fps60) return false;
+    for (int g = 0; g < NGROUP; g++)
+        if (kF60BattleGroups & (1 << g)) g_f60_group_on[g] = mask < 0 ? g_f60_ini_group[g] : (mask >> g) & 1;
+    int fps = g_f60_fps > 0 ? (int)g_f60_fps : 30;
+    f60_statics(fps);
+    f60_apply(fps);
+    return true;
+}
+
 // ---------------------------------------------------------------- menus (Flash UI pad input)
 // The Flash menus read the pad through four ActionScript callbacks (registered at 0x140106a40): GetPadOn / GetPadPress
 // / GetPadRepeat / GetPadRelease -> 0x14065ddc4 / ddf4 / de54 / de24, each `pad->vtbl(...) | ui[+0x2d0/2d8/2e0/2dc]`.
@@ -363,6 +400,8 @@ static bool install_fps60(void) {
           nf, NF60, nc, NC60, ns, NS60, menu ? "hooked" : "off", springs ? "hooked" : "off", g_f60_group_on[G_SUB], g_f60_group_on[G_CAM],
           g_f60_group_on[G_FX], g_f60_group_on[G_MENU], g_f60_group_on[G_SPRING]);
     g_f60_fps = 30;
+    for (int g = 0; g < NGROUP; g++) g_f60_ini_group[g] = g_f60_group_on[g];
+    g_f60_installed = true;
     HANDLE t = CreateThread(NULL, 0, f60_thread, NULL, 0, NULL);
     if (t) CloseHandle(t); else { s4log("ERROR fps60: CreateThread failed, error %lu", GetLastError()); return false; }
     return nf + nc + ns > 0 || menu || springs;

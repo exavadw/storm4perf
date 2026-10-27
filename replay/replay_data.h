@@ -11,6 +11,9 @@ inline constexpr size_t kBspSize = 0x11E0;                // BattleSelectParam (
 inline constexpr uintptr_t kGlobalsBegin = 0x141611A88;   // duel globals written from BattleSelectParam …
 inline constexpr uintptr_t kGlobalsEnd = 0x141612090;     // … and by the battle loaders (snapshot for diagnostics)
 
+// Button layout (ccSaveData's per-player key config, Options > Controller Settings): the 8 battle actions' button masks
+// for sides 0 and 1, as ccPlayerPad::Init caches them. Recorded pad frames hold raw buttons in this layout.
+inline constexpr size_t kKeyActions = 8;
 struct PadFrame {
   uint32_t w[9];  // ccPlayerPad::Ctrl stack frame: on, off, press, release, repeat, analog u16[8]
 };
@@ -62,6 +65,14 @@ struct Recording {
   // reused across battles and this countdown is not reset, so it carries in from earlier battles.
   std::vector<float> ai_timers;
   std::vector<PadFrame> pads[2];
+  std::vector<uint32_t> keys;  // 2 * kKeyActions masks (side 0 then side 1); empty in files from before 1.12
+  // Tick on which each round's opening scene let the players move (one per round start, in order). That scene ends on
+  // UI time, so the tick varies between runs; playback opens input on the recorded tick. Empty before 1.12.
+  std::vector<uint32_t> opens;
+  // Options that change the battle: [0] = ccSaveData+0x120 (show items obtained in battle: with it on, each Ninja
+  // Treasure drop and pickup plays an effect at a random spot drawn from the gameplay RNG); [1] = storm4perf fps60
+  // groups active at 60 FPS (bit g = group g, 0x80000000 = recorded). Empty before 1.12.
+  std::vector<uint32_t> opts;
   std::vector<uint32_t> pad_tick[2];  // tick each pad frame was taken on (diagnostic)
   std::vector<TickHash> hashes;
   std::vector<JudgeRaw> judge_raw;  // diagnostic
