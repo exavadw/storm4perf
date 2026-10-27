@@ -11,6 +11,8 @@
 //   Frame advance: the task-manager pause stack (*0x1416BDA20: push 0x140ABE450(mgr, flags), pop 0x140ABE480(mgr),
 //   depth mgr+0x1438), with the pause menu's own flags (top | 0x80001).
 //   HUD: property "scene_battle" → hide 0x1406D9230(scene) / show 0x1406D924C(scene).
+//   Both controllers drive one pause window: while watching, input.cpp merges pad 2 into pad 1 and shows the game an
+//   idle, connected pad 2 (so pad 2's Start or a pad 2 disconnect never opens the game's 2P menu).
 #include "playback_ui.h"
 
 #ifndef NOMINMAX
@@ -43,8 +45,7 @@ namespace {
 constexpr uintptr_t kAlloc = 0x140A017F0;          // void* (size, file, line)
 constexpr uintptr_t kCreateItems = 0x1406807A0;    // ccUiFlashPauseMenuFreeBattle::CreateItems(menu)
 constexpr uintptr_t kAppendItem = 0x14067F16C;     // (menu, item)
-constexpr uintptr_t kItemRetry = 0x1406811A0, kItemExit = 0x140680F58, kItemCmdList = 0x1406810B4, kItemComboList = 0x140681064,
-                    kItemPopup = 0x140681090;     // ctors(mem) → item
+constexpr uintptr_t kItemRetry = 0x1406811A0, kItemExit = 0x140680F58, kItemPopup = 0x140681090;  // ctors(mem) → item
 constexpr uintptr_t kItemPopupVtbl = 0x141079C50;
 constexpr uintptr_t kItemSetText = 0x140683CF0;    // (item, {label, desc, flags})
 constexpr uintptr_t kItemSetState = 0x140683A5C;   // (item, state)
@@ -231,9 +232,7 @@ void __fastcall hk_create_items(uint8_t* menu) {
   std::vector<uint8_t*> items{make(0x130, 0x80, kItemRetry), choice(0x120, kSpeedChoice), choice(0x118, kStepChoice),
                               choice(0x128, kHudChoice)};
   if (g_save == SaveState::Offer || g_save == SaveState::Full) items.push_back(choice(0x138, kSaveChoice));
-  items.push_back(make(0x108, 0x90, kItemCmdList));
-  items.push_back(make(0x110, 0x90, kItemComboList));
-  items.push_back(make(0x140, 0x80, kItemExit));
+  items.push_back(make(0x140, 0x80, kItemExit));  // no Command List / Combo List while watching (slots 0x108/0x110 stay empty)
   for (auto* it : items) fn<void(__fastcall*)(void*, void*)>(kAppendItem)(menu, it);
 }
 
@@ -331,6 +330,9 @@ void install() {
 
 void tick() {
   const bool viewing = replay::viewing();
+  // From Watch until the replay battle is gone: the game checks the 2P controller while the battle loads, before
+  // playback starts, so pad 2 must already look connected then.
+  input::set_merge_pad2(viewing || replay::armed());
   if (viewing != g_was_viewing) {
     g_was_viewing = viewing;
     if (viewing) {

@@ -37,8 +37,11 @@ Every **VS Battle** in **Free Battle** (against the CPU or local 2P) is recorded
 - **While watching:** the button guide at the bottom right shows the controls. **LB / RB** change the playback speed
   (1/4x to 4x) and **Y** turns frame advance on. In frame advance, **RB** steps one frame and **Y** resumes playback;
   you don't need the menu. **Start** opens the pause menu with **Restart Replay**, **Playback Speed**, **Frame Advance**,
-  **HUD Display**, **Save Replay** (for Recent replays, hidden once saved), the command and combo lists, and
-  **Return to Replays**. Restarting with frame advance on works. Your controller does not affect the replay.
+  **HUD Display**, **Save Replay** (for Recent replays, hidden once saved), and **Return to Replays**. Restarting with
+  frame advance on works. Your controller does not affect the replay.
+- **Two controllers:** both control the same playback: either one's Start opens the one pause menu, and both move
+  its cursor and use the speed and frame-advance buttons. Unplugging (or not having) a second controller doesn't
+  pause the replay.
 - **After a replay:** **Watch Again** or **Return to Replays**.
 - **After a battle you played:** the end menu has a **Save Replay** item, so you can keep it right away. Once saved,
   a message confirms it and the end menu returns without the Save Replay item.
