@@ -62,6 +62,37 @@ Known limits:
   the list's Watch Again and battles started directly matched exactly). Send `StormReplay\logs\replay.log` and the
   replay file if you see a replay that does not match the battle.
 
+## Lower input lag (optional)
+
+Off by default. To turn it on, set in-game **VSync OFF** (Options), then in `storm4perf.ini` under `[lowlat]` set
+`mode=early` (or `mode=elatent`).
+
+The game draws each frame, then leaves the finished image waiting until the start of its *next* frame before it shows
+it: a whole frame (33 ms at 30 FPS) of delay on every button press. `early` shows each frame the moment it is drawn,
+the way Slippi's visual-buffer codes do for Melee. `elatent` also starts each frame just late enough to finish right
+before the screen refreshes, and reads the controller at that later start.
+
+Measured in a Practice battle (30 FPS, 960x540 window, 60 Hz screen, about 275 simulated presses per setting, from the
+press to the screen starting to draw the frame that shows it):
+
+| `[lowlat] mode` (in-game vsync off) | press to screen | difference |
+|---|---|---|
+| `off` (the game's own timing) | 65 ms | |
+| `early` | 37 ms | **-30 ms** |
+| `elatent` | 34 ms | **-33 ms** |
+
+With in-game vsync on the game already waits about 14 ms more (79 ms), and `early` changes nothing there, because the
+frame still waits for the same refresh. So: vsync off plus `early` or `elatent`. In a window, vsync off does not tear
+(Windows shows each frame on a refresh anyway).
+
+- Needs the `gputimer` fix (on by default): with the game's own GPU-timer wait, early showing could hang the game, so
+  `early`/`elatent` stay off when `gputimer=0` (the log says so).
+- Gameplay is unchanged: replays play back identically with `off`, `early` and `elatent`.
+- Tested windowed, on the title screen and in Practice battles. Fullscreen, story mode and online play are not tested yet.
+- `storm4perf.log` shows `OK   lowlat: early present at the render job end` when it is active.
+
+Method, all numbers and the test-only settings: [`docs/lowlat.md`](docs/lowlat.md).
+
 ## What it changes
 
 | fix | what the game does | what storm4perf does |
@@ -141,6 +172,16 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Bug Fix History
+
+### 1.11.0
+
+- Lower input lag, optional (`[lowlat] mode=early` or `elatent`, with in-game vsync off): each frame is shown as soon
+  as the render thread has drawn it instead of at the start of the next game frame. Measured in a Practice battle:
+  press to screen 65 ms -> 37 ms (`early`) / 34 ms (`elatent`). Replays play back identically. Off by default.
+- storm4perf's microsecond clock overflowed after about 10.7 days of Windows uptime (QPC ticks x 1,000,000 in 64 bits);
+  fixed.
+- On any exe other than Steam 1.09, the Storm 4 fixes, replays and options menu now stay off instead of only skipping
+  the fixes whose bytes differ (some hooks were not byte-checked).
 
 ### 1.10.0
 

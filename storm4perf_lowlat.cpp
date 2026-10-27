@@ -68,7 +68,7 @@ static const LlGame kLlGames[] = {
 };
 static const LlGame *g_ll_game;
 static bool g_ll_frames_from_xinput = true;  // read by storm4perf.cpp's XInputGetState
-static volatile LONG g_ll_mode, g_ll_offset_us = -2000;     // current mode (the A/B thread may change it)
+static volatile LONG g_ll_mode, g_ll_offset_us = -5000;     // current mode (the A/B thread may change it)
 static int g_ll_measure, g_ll_block, g_ll_fps = 30, g_ll_wait_start;
 static bool g_ll_vsync_on;
 
@@ -721,7 +721,7 @@ static void install_lowlat(bool gpu_timer_safe) {
     wchar_t v[256];
     GetPrivateProfileStringW(L"lowlat", L"mode", L"off", v, 256, g_ini);
     LONG mode = ll_parse_mode(v);
-    g_ll_offset_us = (LONG)(int)GetPrivateProfileIntW(L"lowlat", L"latent_offset_us", (UINT)-2000, g_ini);
+    g_ll_offset_us = (LONG)(int)GetPrivateProfileIntW(L"lowlat", L"latent_offset_us", (UINT)-5000, g_ini);
     g_ll_measure = GetPrivateProfileIntW(L"lowlat", L"measure", 0, g_ini);
     g_ll_block = GetPrivateProfileIntW(L"lowlat", L"block_real_input", 0, g_ini);
     g_ll_no_focus = GetPrivateProfileIntW(L"lowlat", L"no_focus", 0, g_ini);
