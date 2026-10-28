@@ -64,6 +64,9 @@ struct Recording {
   // Each CPU's decision countdown (ai+0x1A58) at its first decision after "Fight", in call order. The AI object is
   // reused across battles and this countdown is not reset, so it carries in from earlier battles.
   std::vector<float> ai_timers;
+  // Each CPU's 8 timers (ai+0x1A40) at its first think from the battle's first duel tick, in call order, taken after
+  // its task was dropped there: the intro's CPU rolls start from them. Empty before 1.12.1.
+  std::vector<float> ai_pre;
   std::vector<PadFrame> pads[2];
   std::vector<uint32_t> keys;  // 2 * kKeyActions masks (side 0 then side 1); empty in files from before 1.12
   // Tick on which each round's opening scene let the players move (one per round start, in order). That scene ends on

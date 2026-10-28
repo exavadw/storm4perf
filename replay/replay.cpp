@@ -93,6 +93,7 @@ Config g_cfg;
 #ifdef S4P_DEV
 uint32_t g_dev_ticklog = 0, g_dev_ticklog_left = 0, g_dev_ctrl[2]{}, g_dev_tick = 0;  // dev probes (see dev_after_judge)
 int64_t g_dev_last_qpc = 0;
+uint32_t g_dev_dirlog = 0;  // dirlog <n>: log CPU thinks/rolls for the first n duel ticks of each battle, dump the AI object
 int g_dbp_side = -1;
 uint32_t g_dbp_off = 0;
 struct DevWatch {
@@ -164,6 +165,9 @@ bool g_restart_pending = false;  // Restart Replay / Watch Again chosen; cleared
 uint32_t g_pre_fight_ticks = 0;  // duel ticks since the battle setup was applied (Begin runs a fixed count before Fight)
 Segment g_pre_snap;              // RNG on this battle's first duel tick (recorded with the battle; see Recording::pre)
 bool g_pre_have = false;
+std::vector<uint8_t*> g_ai_pre_seen;  // CPUs that thought since the battle's first duel tick
+std::vector<float> g_ai_pre_rec;      // their timers then (copied into the recording at Fight)
+bool g_ai_pre_track = false;          // from the first duel tick to "Fight"
 bool g_started_at_fight = false;  // this battle's recording/playback began at "Fight"; battle-main init must not restart it
 
 // Our recorder object. Only vtbl (+0x00) and mode (+0x4B0) are read outside the hooked Record/Play.
@@ -470,6 +474,7 @@ void start_recording() {
   m.mode = battle_mode();
   m.start = g_started_at_fight ? "fight" : "";
   if (g_started_at_fight && g_pre_have) g_rec.pre.push_back(g_pre_snap);
+  if (g_started_at_fight && g_pre_have) g_rec.ai_pre = g_ai_pre_rec;
   if (g_applied_bsp.size() == kBspSize) {
     g_rec.bsp = g_applied_bsp;
     const uint8_t* bsp = g_rec.bsp.data();
@@ -750,6 +755,18 @@ uint64_t __fastcall hk_ai_decide(uint8_t* ai) {
 #ifdef S4P_DEV
   if (g_dev_ticklog_left) log::info("dev ai t={} ai={:#x} countdown={:.5f}", g_dev_tick, reinterpret_cast<uintptr_t>(ai) & 0xFFFFFF,
                                     *reinterpret_cast<float*>(ai + kAiCountdown));
+  static int dumps = 0;
+  static uint32_t dumped_at = 0;
+  if (g_dev_dirlog && (g_pre_fight_ticks == 1 || (g_ai_track && g_ai_seen.empty())) && dumped_at != g_pre_fight_ticks) {
+    dumped_at = g_pre_fight_ticks;  // the AI object at the battle's first duel tick and at its first decision after Fight
+    if (FILE* f = _wfopen((g_cfg.root / L"logs" / std::format(L"ai-{}.bin", dumps++)).c_str(), L"wb")) {
+      std::fwrite(ai, 1, 0x1B00, f);
+      std::fclose(f);
+    }
+  }
+  if (g_pre_fight_ticks <= g_dev_dirlog)
+    log::info("dev roll pre={} ai={:#x} task={:#x} cd={:.4f}", g_pre_fight_ticks, reinterpret_cast<uintptr_t>(ai) & 0xFFFFFF,
+              *reinterpret_cast<uintptr_t*>(ai + 0x6F0) & 0xFFFFFF, *reinterpret_cast<float*>(ai + kAiCountdown));
 #endif
   if (g_ai_track && std::find(g_ai_seen.begin(), g_ai_seen.end(), ai) == g_ai_seen.end()) {
     const size_t i = g_ai_seen.size();
@@ -759,6 +776,41 @@ uint64_t __fastcall hk_ai_decide(uint8_t* ai) {
     else if (g_mode == Mode::Playing && !g_play_done && i < g_play.ai_timers.size()) t = g_play.ai_timers[i];
   }
   return o_ai_decide(ai);
+}
+
+// The CPU also thinks during the battle-begin intro, from the battle's first duel tick, and comes in with state from
+// thinks before that tick, which run on UI time: its timers (ai+0x1A40, 8 floats counted down by ccCpuPlayer::CtrlThink
+// 0x14075E52C; [6] is the decision countdown, re-armed from an RNG that is not restored yet) and sometimes a task
+// (ai+0x6F0; CheckAction only picks a new action without one). In recorded battles and in replays that stored them, each
+// CPU's first think from that tick drops its task (vtable +0x30, the call CtrlThink makes when a task ends) and starts
+// from the recorded timers, so the intro (and what the CPU is doing at "Fight") plays out as recorded.
+constexpr uintptr_t kAiThink = 0x14075E52C, kAiTimers = 0x1A40;
+constexpr size_t kAiTimerCount = 8;
+using AiThinkFn = void(__fastcall*)(uint8_t*);
+AiThinkFn o_ai_think = nullptr;
+bool will_record() {
+  return g_mode == Mode::ArmedRec ||
+         (g_cfg.auto_record && battle_mode() == 0 && (g_mode == Mode::Idle || g_mode == Mode::Recording));
+}
+void __fastcall hk_ai_think(uint8_t* ai) {
+  if (g_ai_pre_track && std::find(g_ai_pre_seen.begin(), g_ai_pre_seen.end(), ai) == g_ai_pre_seen.end()) {
+    const size_t i = g_ai_pre_seen.size();
+    g_ai_pre_seen.push_back(ai);
+    auto* t = reinterpret_cast<float*>(ai + kAiTimers);
+    const bool playing = g_mode == Mode::ArmedPlay || (g_mode == Mode::Playing && !g_play_done);
+    const bool restore = playing && !g_norestore && (i + 1) * kAiTimerCount <= g_play.ai_pre.size();
+#ifdef S4P_DEV
+    if (g_dev_dirlog) log::info("dev think pre={} ai={:#x} task={:#x} cd={:.4f}", g_pre_fight_ticks, reinterpret_cast<uintptr_t>(ai) & 0xFFFFFF,
+                                *reinterpret_cast<uintptr_t*>(ai + 0x6F0) & 0xFFFFFF, t[6]);
+#endif
+    if (restore || (!playing && will_record())) {
+      using ClearTask = void(__fastcall*)(uint8_t*);
+      (*reinterpret_cast<ClearTask*>(*reinterpret_cast<uintptr_t*>(ai) + 0x30))(ai);
+    }
+    if (restore) std::memcpy(t, g_play.ai_pre.data() + i * kAiTimerCount, kAiTimerCount * sizeof(float));
+    else if (!playing) g_ai_pre_rec.insert(g_ai_pre_rec.end(), t, t + kAiTimerCount);
+  }
+  o_ai_think(ai);
 }
 
 using FightFn = void(__fastcall*)(void*);
@@ -792,6 +844,7 @@ void __fastcall hk_fight(void* begin) {
     g_started_at_fight = true;
     g_ai_seen.clear();
     g_ai_track = true;
+    g_ai_pre_track = false;
     on_round_start(true);
   }
   o_fight(begin);
@@ -959,6 +1012,9 @@ void dev_after_judge() {
 
 uintptr_t __fastcall hk_judge(void* judge) {
   if (++g_pre_fight_ticks == 1) {  // the battle's first duel tick: the intro (and the CPU AI) start drawing from here
+    g_ai_pre_seen.clear();
+    g_ai_pre_rec.clear();
+    g_ai_pre_track = true;
     if (g_rng_pre && g_rng_armed.exchange(false)) {
       g_rng_n = 0;
       g_rng_tick = 0;
@@ -1056,6 +1112,7 @@ void install(const Config& cfg) {
   hooks::install("ccBattleRecord::Play", game::at(kPlay), reinterpret_cast<void*>(&hk_play), reinterpret_cast<void**>(&o_play));
   hooks::install("BattleMain::Initialize", game::at(kBattleMainInit), reinterpret_cast<void*>(&hk_battle_init),
                  reinterpret_cast<void**>(&o_battle_init));
+  hooks::install("ccCpuPlayer::CtrlThink", game::at(kAiThink), reinterpret_cast<void*>(&hk_ai_think), reinterpret_cast<void**>(&o_ai_think));
   hooks::install("CpuAi::Decide", game::at(kAiDecide), reinterpret_cast<void*>(&hk_ai_decide), reinterpret_cast<void**>(&o_ai_decide));
   hooks::install("MT::genrand", game::at(kGenrand), reinterpret_cast<void*>(&hk_genrand), reinterpret_cast<void**>(&o_genrand));
   hooks::install("BattleBegin::Fight", game::at(kFight), reinterpret_cast<void*>(&hk_fight), reinterpret_cast<void**>(&o_fight));
@@ -1290,6 +1347,10 @@ std::string command(const std::string& args) {
     const uint32_t old = *p;
     *p = static_cast<uint32_t>(std::stoul(v, nullptr, 16));
     return std::format("ok {} {:#x} -> {:#x}", va, old, *p);
+  }
+  if (sub == "dirlog") {  // dev: dirlog <n>: log CPU thinks/rolls for the first n duel ticks of each battle
+    g_dev_dirlog = static_cast<uint32_t>(std::atoi(rest.c_str()));
+    return std::format("ok dirlog {}", g_dev_dirlog);
   }
   if (sub == "ticklog") {  // dev: ticklog <n>: log pacing and Ctrl calls for n duel ticks from each Fight
     g_dev_ticklog = static_cast<uint32_t>(std::atoi(rest.c_str()));
