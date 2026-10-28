@@ -86,6 +86,14 @@ static bool g_f60_static_ok[NS60];
 
 static float *g_f60_slot;              // NF60 floats, in our own read-write page near the exe
 static bool g_f60_float_ok[NF60], g_f60_count_ok[NC60];
+
+// nuccAnm::Elapse (0x140a16c90) advances the billboards (camera-facing sprites) of an animated
+// model by nuccBillboard::Elapse(bb, 3000 / 60) every frame: a hard-coded 60 where every other caller divides by the
+// fps. Measured in game (probe/animspeed, COM vs COM): those billboards advance 1500 units/s at 30 and 3000 at 60, so
+// they play twice as fast at 60. The `mov eax,0x88888889; mul [3000]; shr edx,5` at 0x140a16d69 becomes
+// `mov edx,imm32` + nops; the immediate is 50 (the game's value) at 30 and 1500/fps with fps60_effects on.
+static const uint64_t kF60BbSite = 0x140a16d69;
+static bool g_f60_bb_ok;
 static int g_f60_group_on[NGROUP];
 static volatile LONG g_f60_fps;        // fps the slots currently hold (30 = original values)
 
@@ -113,6 +121,10 @@ static void f60_apply(int fps) {
             uint8_t b = (uint8_t)(n > cap ? cap : n);
             if (*VA(c.va + c.imm_off) != b) write_bytes("fps60", VA(c.va + c.imm_off), &b, 1);
         }
+    if (g_f60_bb_ok) {
+        uint8_t b = (uint8_t)(g_f60_group_on[G_FX] ? 1500 / fps : 50);
+        if (*VA(kF60BbSite + 1) != b) write_bytes("fps60", VA(kF60BbSite + 1), &b, 1);
+    }
     for (int i = 0; i < NS60; i++)
         if (g_f60_static_ok[i] && !kF60Statics[i].ival) {  // float statics: x *= (30/fps)*k, value = (30/fps)*k at 30
             const F60Static &st = kF60Statics[i];
@@ -384,6 +396,11 @@ static bool install_fps60(void) {
     }
     for (int i = 0; i < NC60; i++)
         if (check_bytes("fps60", kF60Counts[i].va, kF60Counts[i].bytes, kF60Counts[i].len)) { g_f60_count_ok[i] = true; nc++; }
+    static const uint8_t bb[] = { 0xb8,0x89,0x88,0x88,0x88, 0xf7,0x25,0xa8,0xe3,0x6e,0x00, 0xc1,0xea,0x05 };
+    if (check_bytes("fps60", kF60BbSite, bb, sizeof bb) && *(uint32_t *)VA(0x14110511c) == 3000) {
+        static const uint8_t mov[] = { 0xba,50,0,0,0, 0x0f,0x1f,0x80,0,0,0,0, 0x66,0x90 };  // mov edx,50 ; nop7 ; nop2
+        g_f60_bb_ok = write_bytes("fps60", VA(kF60BbSite), mov, sizeof mov);
+    } else s4log("SKIP fps60 billboard step: unexpected code at 0x%llX", kF60BbSite);
     int ns = 0;
     for (int i = 0; i < NS60; i++) {
         const F60Static &st = kF60Statics[i];
@@ -396,13 +413,13 @@ static bool install_fps60(void) {
     }
     bool menu = g_f60_group_on[G_MENU] && install_fps60_menu();
     bool springs = g_f60_group_on[G_SPRING] && install_fps60_springs();
-    s4log("fps60: %d/%d constants, %d/%d counters, %d/%d statics, menu %s, springs %s; groups substitution=%d camera=%d effects=%d menu=%d springs=%d",
-          nf, NF60, nc, NC60, ns, NS60, menu ? "hooked" : "off", springs ? "hooked" : "off", g_f60_group_on[G_SUB], g_f60_group_on[G_CAM],
+    s4log("fps60: %d/%d constants, %d/%d counters, %d/%d statics, billboard step %s, menu %s, springs %s; groups substitution=%d camera=%d effects=%d menu=%d springs=%d",
+          nf, NF60, nc, NC60, ns, NS60, g_f60_bb_ok ? "patched" : "off", menu ? "hooked" : "off", springs ? "hooked" : "off", g_f60_group_on[G_SUB], g_f60_group_on[G_CAM],
           g_f60_group_on[G_FX], g_f60_group_on[G_MENU], g_f60_group_on[G_SPRING]);
     g_f60_fps = 30;
     for (int g = 0; g < NGROUP; g++) g_f60_ini_group[g] = g_f60_group_on[g];
     g_f60_installed = true;
     HANDLE t = CreateThread(NULL, 0, f60_thread, NULL, 0, NULL);
     if (t) CloseHandle(t); else { s4log("ERROR fps60: CreateThread failed, error %lu", GetLastError()); return false; }
-    return nf + nc + ns > 0 || menu || springs;
+    return nf + nc + ns > 0 || g_f60_bb_ok || menu || springs;
 }
