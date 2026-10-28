@@ -65,9 +65,8 @@ Known limits:
 - The pause between rounds (KO, then the next round's intro) runs on the game's menu clock. If it takes a frame or two
   longer or shorter than when the replay was recorded, the replay can drift from the start of the next round (seen in 2
   of 4 viewings of a 60 FPS two-round replay; the first round matched in all 4).
-- Sometimes a replay diverges from its very first frame (seen in 2 of 17 test viewings of 60 FPS replays); the same
-  replay matched when watched again. During the battle intro the CPU makes a different number of random rolls from one
-  viewing to the next, and occasionally that carries into the fight. Not fixed yet.
+- Replays recorded before 1.12.3 can diverge from their very first frame, depending on the viewing (in testing, the same
+  60 FPS replay matched in 6 of 6 viewings at one time and diverged in 3 of 4 at another). See 1.12.3 below.
 - Send `StormReplay\logs\replay.log` and the replay file if you see a replay that does not match the battle.
 
 ## Lower input lag (optional)
@@ -189,6 +188,20 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Bug Fix History
+
+### 1.12.3
+
+- **Fixed: a replay could diverge from its very first frame.** The CPU already thinks during the battle intro, and the
+  timers that decide when it acts carried values from before the battle, which differed every time the game ran. Most
+  of the time the fight still lined up, but sometimes the CPU started something in the intro that it did not start in
+  the recording. Replays now store those timers as the intro begins, and in recorded battles and their replays the CPU
+  drops any action left over from before the intro, so the intro plays out as recorded. Replays recorded with older
+  versions play as before.
+- Checked in game at 60 FPS (1P vs COM): watching a 1.12.0 replay six times, the CPU's countdown at the start of the
+  intro was different every time and the intro drew a different number of random numbers (683 to 811). A replay
+  recorded with 1.12.3 played back identically in 6 of 6 viewings, with the same intro and the same CPU state at
+  "Fight", although the CPU came into the intro with a leftover action in 3 of them and with a different countdown each
+  time. The 1.8.1 showcase replay (30 FPS) still plays back identically.
 
 ### 1.12.2
 
