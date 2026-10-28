@@ -97,7 +97,7 @@ match across it**: the showcase replay drifts from frame 222 on with `elatent`. 
 `elatent` if you want the last 3 ms.
 
 So: vsync off plus `early` (or `elatent`). In a window, vsync off does not tear (Windows shows each frame on a refresh
-anyway).
+anyway). Early present works in a window only; in fullscreen the game presents as usual.
 
 - Needs the `gputimer` fix (on by default): with the game's own GPU-timer wait, early showing could hang the game, so
   `early`/`elatent` stay off when `gputimer=0` (the log says so).
@@ -189,6 +189,15 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 (BSD 2-clause, `replay/minhook/LICENSE.txt`).
 
 ## Bug Fix History
+
+### 1.12.2
+
+- **`[lowlat] mode=early` / `elatent`: each frame is presented exactly once, and the render thread never waits in
+  Present.** About once in 6,300 frames the game's own Present got there first and the render thread then presented
+  the same image again, skipping the next one; now whichever thread takes a finished image presents it. With the GPU's
+  present queue full, the image goes back to the game's Present instead of holding up the next frame. Early present
+  now runs only with in-game VSync off and in a window (fullscreen keeps the game's own Present). Details:
+  [`docs/lowlat.md`](docs/lowlat.md).
 
 ### 1.12.1
 

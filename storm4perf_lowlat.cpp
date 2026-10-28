@@ -327,8 +327,14 @@ static HRESULT STDMETHODCALLTYPE ll_present_body(IDXGISwapChain *sc, UINT sync, 
 // early present: the render thread presents at its job end; the main thread's next Present is skipped
 static SRWLOCK g_ll_plock = SRWLOCK_INIT;      // one Present at a time between the two threads
 static volatile LONG g_ll_early_pending;      // the render thread presented since the main thread's last Present
-static volatile LONG g_ll_main_sync;          // sync interval the game asks for
-static volatile LONG64 st_ll_early, st_ll_main_skipped, st_ll_main_through;
+// Set by the job-end stub (ll_install_ready) before the render thread clears its busy flag: a drawn image nobody has
+// presented. Whoever takes it under g_ll_plock presents it: normally the render thread; the main thread when it got to
+// its Present first (its Flip only needs the busy flag clear), as it always does with early present off.
+static volatile LONG g_ll_ready;
+static volatile LONG g_ll_main_sync = 1;      // sync interval the game asks for: early only with 0 (vsync on gains nothing)
+static volatile LONG g_ll_windowed;           // lowlat_tick: the swapchain is windowed (DXGI may SendMessage to the game's
+                                              // window, its main thread, from a fullscreen Present while that thread waits)
+static volatile LONG64 st_ll_early, st_ll_main_skipped, st_ll_main_through, st_ll_queue_full;
 static __declspec(thread) int t_ll_early;
 static DWORD g_ll_render_tid;
 // Called right after the render thread released the job lock (so no lock order with the main thread's kick). Present
@@ -336,26 +342,49 @@ static DWORD g_ll_render_tid;
 // it a loading thread's resource update raced this Present and the NVIDIA driver faulted and hung (2026-10-27).
 static void ll_job_end(void) {
     g_ll_render_tid = GetCurrentThreadId();
-    if (!ll_is_early(g_ll_mode) || !g_ll_sc) return;
+    if (!ll_is_early(g_ll_mode) || !g_ll_sc || g_ll_main_sync != 0 || !g_ll_windowed) return;   // the game presents it
     uint8_t *mgr = g_ll_game ? *(uint8_t **)VA(g_ll_game->mgr) : NULL;
     LPCRITICAL_SECTION ctx_cs = mgr ? *(LPCRITICAL_SECTION *)(mgr + 0x78) : NULL;
     if (!ctx_cs) return;  // no lock to take: leave the Present to the game
     EnterCriticalSection(ctx_cs);  // before g_ll_plock: a game Present that goes through may already hold ctx_cs
     AcquireSRWLockExclusive(&g_ll_plock);
-    t_ll_early = 1;
-    g_ll_sc->Present((UINT)g_ll_main_sync, 0);  // through the vtable, so ll_present does the bookkeeping
-    t_ll_early = 0;
-    InterlockedExchange(&g_ll_early_pending, 1); InterlockedIncrement64(&st_ll_early);
+    if (InterlockedExchange(&g_ll_ready, 0)) {  // not presented by the main thread already
+        // DO_NOT_WAIT: with the GPU's present queue full this thread would sleep here while the next frame's draw list
+        // waits behind it; the image goes back to the main thread's next Present instead.
+        t_ll_early = 1;
+        HRESULT hr = g_ll_sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);  // through the vtable, so ll_present does the bookkeeping
+        t_ll_early = 0;
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { InterlockedExchange(&g_ll_ready, 1); InterlockedIncrement64(&st_ll_queue_full); }
+        else { InterlockedExchange(&g_ll_early_pending, 1); InterlockedIncrement64(&st_ll_early); }
+    }
     ReleaseSRWLockExclusive(&g_ll_plock);
     LeaveCriticalSection(ctx_cs);
+}
+// The busy-flag clear right before the job-end LeaveCriticalSection (`mov byte [rbx+88h],0`, 7 bytes, checked by
+// install_jobend_redirect) becomes a call to a stub that sets g_ll_ready first. rax is free there (the next instructions
+// load rcx and call LeaveCriticalSection).
+static bool ll_install_ready(uint64_t clear_va) {
+    uint8_t *site = VA(clear_va), *stub = alloc_stub(32); int32_t rel;
+    if (!stub || !rel32_to(site, 5, stub, &rel)) return false;
+    volatile LONG *f = &g_ll_ready; uint8_t *p = stub;
+    *p++ = 0x48; *p++ = 0xB8; memcpy(p, &f, 8); p += 8;                  // mov rax, &g_ll_ready
+    static const uint8_t body[] = { 0xC7,0x00,0x01,0x00,0x00,0x00,          // mov dword [rax], 1
+                                    0xC6,0x83,0x88,0x00,0x00,0x00,0x00,     // mov byte [rbx+88h], 0 (the original)
+                                    0xC3 };
+    memcpy(p, body, sizeof body);
+    uint8_t b[7] = { 0xE8, 0, 0, 0, 0, 0x66, 0x90 }; memcpy(b + 1, &rel, 4);
+    return write_bytes("lowlat early (job end)", site, b, sizeof b);
 }
 static HRESULT STDMETHODCALLTYPE ll_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     if (!t_ll_early && sc == g_ll_sc && !t_ll_in_present) {
         InterlockedExchange(&g_ll_main_sync, (LONG)sync);
-        if (ll_is_early(g_ll_mode) && InterlockedExchange(&g_ll_early_pending, 0)) { InterlockedIncrement64(&st_ll_main_skipped); return S_OK; }
-        if (ll_is_early(g_ll_mode)) {  // the render job is late: present the old image as the game would, never at once with it
-            InterlockedIncrement64(&st_ll_main_through);
-            AcquireSRWLockExclusive(&g_ll_plock); HRESULT hr = ll_present_body(sc, sync, flags); ReleaseSRWLockExclusive(&g_ll_plock);
+        if (ll_is_early(g_ll_mode)) {  // never at once with the render thread's Present
+            AcquireSRWLockExclusive(&g_ll_plock);
+            if (InterlockedExchange(&g_ll_early_pending, 0)) { ReleaseSRWLockExclusive(&g_ll_plock); InterlockedIncrement64(&st_ll_main_skipped); return S_OK; }
+            // the render thread did not show it: its job ended while this thread was already in Flip, its Present found the
+            // queue full, or it presents nothing (vsync on, fullscreen); this Present shows the image as the game would
+            if (InterlockedExchange(&g_ll_ready, 0) && sync == 0 && g_ll_windowed) InterlockedIncrement64(&st_ll_main_through);
+            HRESULT hr = ll_present_body(sc, sync, flags); ReleaseSRWLockExclusive(&g_ll_plock);
             return hr;
         }
     }
@@ -621,7 +650,7 @@ static void ll_report(const char *when) {
               when, kLlNames[g_ll_ab[i].mode], g_ll_ab[i].offset_us, s.n, s.sum[5] / s.n / 1000, s.mn / 1000.0, s.mx / 1000.0,
               s.sum[0] / s.n / 1000, s.sum[1] / s.n / 1000, s.sum[2] / s.n / 1000, s.sum[3] / s.n / 1000, s.sum[4] / s.n / 1000);
     }
-    if (st_ll_early) s4log("lowlat %s: early presents=%lld, main Presents skipped=%lld, main Presents through (render job late)=%lld", when, st_ll_early, st_ll_main_skipped, st_ll_main_through);
+    if (st_ll_early) s4log("lowlat %s: early presents=%lld, main Presents skipped=%lld, main Presents through (render job late)=%lld, present queue full=%lld", when, st_ll_early, st_ll_main_skipped, st_ll_main_through, st_ll_queue_full);
     s4log("lowlat %s: waits=%lld (avg %.2f ms) late=%lld dup_present=%lld no_present=%lld | capture frames=%lld lost=%lld occluded=%lld | refresh %.3f ms, work est %.2f ms",
           when, st_ll_waits, st_ll_waits ? st_ll_wait_us / 1000.0 / st_ll_waits : 0.0, st_ll_late, st_ll_dup_present, st_ll_no_present,
           st_ll_dup_frames, st_ll_dup_lost, st_ll_occluded, g_ll_period_x1000 / 1e6, ll_work_estimate() / 1000.0);
@@ -770,7 +799,7 @@ static void install_lowlat(bool gpu_timer_safe) {
         g_ll_mode = g_ll_ab[0].mode; uses_early = false;
     }
     if (uses_early) {
-        if (g_ll_game && install_jobend_redirect(g_ll_game->clear, g_ll_game->clear + 14)) { g_jobend_cb = ll_job_end; s4log("OK   lowlat: early present at the render job end"); }
+        if (g_ll_game && install_jobend_redirect(g_ll_game->clear, g_ll_game->clear + 14) && ll_install_ready(g_ll_game->clear)) { g_jobend_cb = ll_job_end; s4log("OK   lowlat: early present at the render job end"); }
         else {
             s4log("FAIL lowlat: early present needs the render job end site (known exe, site not taken by another mod); early -> off, elatent -> latent");
             for (int i = 0; i < g_ll_nab; i++) if (ll_is_early(g_ll_ab[i].mode)) g_ll_ab[i].mode = g_ll_ab[i].mode == LL_EARLY ? LL_OFF : LL_LATENT;
@@ -793,4 +822,11 @@ static void install_lowlat(bool gpu_timer_safe) {
 static void lowlat_tick(void) {  // background thread: patch modules loaded after start-up too
     static int n;
     if (g_ll_block && n < 2) { n++; ll_block_keyboard(n == 1 ? "first tick" : "second tick"); }
+    if (ll_is_early(g_ll_mode) && g_ll_sc) {   // early present only windowed (g_ll_windowed)
+        BOOL fs = FALSE;
+        AcquireSRWLockExclusive(&g_ll_plock);   // never next to either thread's Present
+        LONG w = SUCCEEDED(g_ll_sc->GetFullscreenState(&fs, NULL)) && !fs;
+        ReleaseSRWLockExclusive(&g_ll_plock);
+        if (InterlockedExchange(&g_ll_windowed, w) != w) s4log("lowlat: early present %s", w ? "active (windowed)" : "paused (fullscreen: the game presents)");
+    }
 }

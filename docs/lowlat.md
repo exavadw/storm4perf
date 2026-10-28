@@ -22,9 +22,18 @@ allows, so there is no Melee-style polling drift to fix.
 
 ## The modes
 
-- `early`: the render thread presents at the end of its job (the `LeaveCriticalSection` after it clears the busy flag at
-  `+0x88`, `0x14018C8E2`, the site `flipwait` also uses), still holding the job lock so the next kick waits for it. The
-  main thread's next Present is skipped. If a job is late, the main thread's Present goes through as before.
+- `early`: the render thread presents at the end of its job (right after the `LeaveCriticalSection` that follows the
+  busy-flag clear at `+0x88`, `0x14018C8E2`, the site `flipwait` also uses), and the main thread's next Present is
+  skipped. Since 1.12.2:
+  - a stub at the busy-flag clear (`0x14018C8D4`) marks the drawn image as ready first, and whichever thread takes it
+    under the present lock presents it, so every image goes out exactly once. Before, when the main thread reached its
+    Present first (its Flip only waits for the busy flag), the render thread presented the same back buffer again and
+    the next real image was then skipped (about once in 6,300 frames);
+  - the render thread presents with `DXGI_PRESENT_DO_NOT_WAIT`: if the GPU's present queue is full the image goes back
+    to the main thread instead of the render thread sleeping in Present while the next frame's draw list waits;
+  - it presents only with the game's vsync off (sync interval 0; vsync on gains nothing) and a windowed swapchain
+    (checked every few seconds): from a fullscreen Present, DXGI may `SendMessage` to the game window, whose thread can
+    be waiting for that Present's locks.
 - `latent` (test only, changes gameplay): the start of each tick is held inside the tick's first pad read, so the
   Present lands `latent_offset_us` before a refresh on an exact 2-refresh cadence; the pad read happens after the wait.
   Needs in-game vsync off. Replays can diverge under it (see Replays); on its own it is test only.
@@ -84,6 +93,14 @@ the game's GPU-timer readback (`0x14019F400`, `GetData` until the GPU answers) a
 `nummSkinningThreadGPU::WaitForEnd`. With `gputimer` alone, `elatent` ran 5 minutes of battle without a stall; with
 the default fixes, 7.5 and 6 minutes. `early`/`elatent` therefore stay off when `gputimer` is off. A watchdog logs both
 threads' stacks if the pad reads stop for 3 s.
+
+## 1.12.2 check
+
+Practice battle, 5 minutes, default fixes, `early`, vsync off, windowed (2026-10-27): 16,799 images presented by the
+render thread, 15 by the main thread (14 of them handed back because the present queue was full), no stall; read to
+Present 5.35 ms mean (p95 7.75). The guardfix showcase replay with `early`: IDENTICAL 3 of 3 (1.11.0: 4 of 5, one drifted
+at tick 222; 1.12.0's replay fixes came in between, so this does not say which change cured it). The same hand-off ships in the Storm 1 online client (storm1-online
+`docs/design/early-present.md`), where it also passed rollback and netplay checks.
 
 ## Replays
 
