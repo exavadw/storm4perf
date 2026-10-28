@@ -190,6 +190,19 @@ its `tools/sync-storm4perf.sh`. `replay/minhook` is [MinHook](https://github.com
 
 ## Bug Fix History
 
+### 1.12.1
+
+- **Fixed (`fps60_effects`): the billboard animations of animated models ran twice as fast at 60 FPS.** Billboards are
+  camera-facing sprites that are part of a model's animation. The game advances them by a fixed 1/60 s step every
+  frame, where everything else uses the frame rate, so they played at half speed at 30 FPS and full speed at 60. At 60
+  they now play as at 30; 30 FPS is unchanged. Measured in game with an animation-rate probe (COM vs COM): 1500 units/s
+  at 30, 3000 at 60 before the fix, 1500 at 60 with it.
+- Measured at the same time, and unchanged because they already match 30 FPS: character, camera and material
+  animations (3000 units/s at both rates, also during slow-motion), particle ageing and particle billboards, the menus'
+  Flash animations (real time at both rates), and the length of the 0.05 slow-motion (333 ms at both). The common 0.4
+  slow-motion is 233 ms at 30 and about 200 ms at 60: the game's state changes take two frames, which is shorter at 60.
+- The billboard clock is only read for drawing, so replays are not affected.
+
 ### 1.12.0
 
 - **Replays keep the button layouts.** A replay stores both players' button layouts (Options > Controller Settings) and
